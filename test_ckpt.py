@@ -21,6 +21,7 @@ from utils.eval_baselines import (
     evaluate_drift_aware_matched_keep,
     evaluate_emc_matched_keep
 )
+from utilities import find_latest_ckpt, load_cfg_from_checkpoint_or_yaml
 from utils.config import Config
 from predictor import RecurrentActorCriticPolicy
 from utils.actions import build_action_spec
@@ -49,85 +50,6 @@ class EvalCfg:
     sparsity_bias: float = 0.0
     quant_bias: float = 0.0
     prune_bias: float = 0.0
-
-
-def find_latest_ckpt(ckpt_dir: str, mode: str) -> Optional[str]:
-    if not os.path.isdir(ckpt_dir):
-        return None
-    latest = os.path.join(ckpt_dir, f"policy_{mode}.pt")
-    if os.path.exists(latest):
-        return latest
-    cands = [f for f in os.listdir(ckpt_dir) if f.startswith("policy_epoch") and f.endswith(".pt")]
-    if not cands:
-        return None
-    cands.sort()
-    return os.path.join(ckpt_dir, cands[-1])
-
-
-def load_cfg_from_checkpoint_or_yaml(
-    ckpt_dir: str,
-    ckpt_path: str,
-    dataset_name: Optional[str],
-    dataset_config: Optional[str],
-    text_field: Optional[str],
-    batch_size: Optional[int],
-) -> Config:
-    """
-    Load the *training* config for evaluation.
-    Priority:
-      1) 'cfg' dict embedded in the checkpoint
-      2) YAML recorded in 'meta.config_paths.base' -> ckpt_dir/code/<relpath> (or train_meta.json)
-      3) Default Config()
-    Then apply only dataset-related overrides.
-    """
-    cfg = Config()
-    sd_cpu = torch.load(ckpt_path, map_location="cpu")
-    sd_cfg = sd_cpu.get("cfg")
-    if sd_cfg:
-        print("[eval] Using training config embedded in checkpoint.")
-        for k, v in sd_cfg.items():
-            if hasattr(cfg, k):
-                setattr(cfg, k, v)
-    else:
-        meta = sd_cpu.get("meta", None)
-        if meta is None:
-            meta_path = os.path.join(ckpt_dir, "train_meta.json")
-            if os.path.exists(meta_path):
-                with open(meta_path, "r") as f:
-                    meta = json.load(f)
-        if meta is None:
-            print("[eval] No 'meta' found in checkpoint or train_meta.json.")
-        base_rel = None
-        if meta is not None:
-            base_rel = meta.get("config_paths", {}).get("base")
-            kind = meta.get("kind", "unknown")
-            print(f"[eval] meta.kind={kind}")
-            print(f"[eval] meta.config_paths={meta.get('config_paths', {})}")
-        if base_rel:
-            yaml_path = os.path.join(ckpt_dir, "code", base_rel)
-            if os.path.exists(yaml_path):
-                from utils.config import apply_cfg_overrides_from_file
-                apply_cfg_overrides_from_file(cfg, yaml_path, is_main=True)
-                print(f"[eval] Applied base YAML overrides from snapshot: {yaml_path}")
-            else:
-                print(f"[eval] Saved base config not found at {yaml_path}; using defaults.")
-        else:
-            print("[eval] No training config in checkpoint or meta; using defaults.")
-
-    # Runtime device/dtype
-    cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg.dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    # Dataset-only overrides
-    if dataset_name is not None:
-        cfg.dataset_name = dataset_name
-    if dataset_config is not None:
-        cfg.dataset_config = dataset_config
-    if text_field is not None:
-        cfg.text_field = text_field
-    if batch_size is not None:
-        cfg.batch_size = batch_size
-    # Keep the same seed semantics as training unless the caller wants a different one.
-    return cfg
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--ckpt_dir", type=str, default=None)
@@ -167,8 +89,6 @@ cfg = load_cfg_from_checkpoint_or_yaml(
     ckpt_path=ckpt_path,
     dataset_name=E.dataset_name,
     dataset_config=E.dataset_config,
-    text_field=E.text_field,
-    batch_size=E.batch_size,
 )
 
 

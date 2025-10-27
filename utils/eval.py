@@ -290,20 +290,6 @@ def evaluate_stateful_policy_rollout(
 
             # Histogram should also reflect the effective action:
             action_hist.index_add_(0, a_eff, torch.ones_like(a_eff, dtype=torch.float32))
-            # # Advance policy state; the policy should remember the ORIGINAL action id
-            # pi_state = pi_state_next
-            # pi_state.last_action = a.detach()
-            # # Per-action values; densify ρ/q on non-effective steps using the spec's dense action.
-            # kappa_now = torch.where(
-            #     eff_mask, KEEP_PER_ACTION[a], torch.ones_like(KEEP_PER_ACTION[a])
-            # )  # [B]
-            # prune_now = torch.where(
-            #     eff_mask, PRUNE_PER_ACTION[a], torch.full_like(PRUNE_PER_ACTION[a], p_dense_val)
-            # )  # [B]
-            # qbits_now = torch.where(
-            #     eff_mask, QBITS_PER_ACTION[a], torch.full_like(QBITS_PER_ACTION[a], q_dense_val)
-            # )  # [B]
-            # qratio_now = qbits_now.to(torch.float32).clamp_(min=1.0) / 16.0
 
             # ---- Group by (prune, quant) to set model-global controls per forward ----
             # Build grouping keys; use float for uniqueness (bits cast to float)

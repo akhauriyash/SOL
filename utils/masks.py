@@ -215,9 +215,6 @@ def _build_quest_mask(
     mask = mask.masked_fill(~(token_keep & allowed_K), torch.finfo(q_dtype).min)
     return mask
 
-
-
-
 def enable_quest_attention(model, page_size: int = 16) -> None:
     from transformers.models.llama import modeling_llama as llama_mod
 

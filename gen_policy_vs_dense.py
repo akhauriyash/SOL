@@ -14,7 +14,7 @@ import random
 import numpy as np
 from pprint import pprint
 import torch
-from eval_policy_lmeval import PolicyHarnessLM
+from policy_harness import PolicyHarnessLM
 import torch, torch.nn.functional as F
 
 def avg_ll_under_dense(dense_model: PolicyHarnessLM, prompt: str, continuation: str) -> float:
@@ -118,6 +118,12 @@ def main():
     p.add_argument("--dense_refresh_tail", type=int, default=None, help="Tail tokens to dense-prefill between episodes")
     p.add_argument("--batch_size", type=int, default=1, help="Internal LM-Eval wrapper batch size (safe to keep at 1)")
     p.add_argument("--seed", type=int, default=None, help="Set RNG seed for reproducibility")
+    p.add_argument("--sparsity_bias", type=float, default=0,
+                        help="Positive values bias the policy toward sparser actions during eval.")
+    p.add_argument("--quant_bias", type=float, default=0,
+                        help="Positive values bias the policy toward more quantization during eval.")
+    p.add_argument("--prune_bias", type=float, default=0,
+                        help="Positive values bias the policy toward more pruning during eval.")
 
     args = p.parse_args()
     set_seed(args.seed)
@@ -131,6 +137,9 @@ def main():
         dense_refresh_tail=args.dense_refresh_tail,
         dense_only=False,
         max_batch=args.batch_size,
+        sparsity_bias=args.sparsity_bias,
+        prune_bias=args.prune_bias,
+        quant_bias=args.quant_bias,
     )
 
     dense_model = PolicyHarnessLM(
@@ -178,8 +187,12 @@ def main():
     policy_ll = avg_ll_under_dense(dense_model, prompt, policy_text)
     dense_ll  = avg_ll_under_dense(dense_model, prompt, dense_text)
     print(f"Mean logprob under dense LM -> policy: {policy_ll:.4f}, dense: {dense_ll:.4f}")
-
-    pprint(stats)
+    # pprint(stats)
+    print("============================\n")
+    print(f"Achieved Token-Sparsity\t{100*stats['keep_avg_eff']}%")
+    print(f"Achieved Prune-Keep\t{100*stats['prune_avg_eff']}%")
+    print(f"Achieved Quant-Ratio\t{stats['quant_ratio_avg_eff']} (1 = full 16-bit)\n")
+    print("============================\n")
 
 if __name__ == "__main__":
     main()
