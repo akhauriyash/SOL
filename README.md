@@ -1,5 +1,7 @@
 # Self Optimizing Language Models
 
+![SOL Main Figure descriing how training and inference work.](SOLMainFig_Png.png)
+
 Work on efficient Large Language Model (LLM) inference has emphasized how to make every decoding step cheaper (quantization, sparsity), but less so on how much compute each token should receive. This leaves deployments with a rigid, per-token budget that over-computes on easy tokens and under-computes on hard ones. We study step-adaptive budget allocation: learning, at generation time, how much past context to consult for each token. Concretely, we train a small policy network ($0.5\%$ of the LLM size) that reads the LLM’s hidden state and selects a discrete action $\kappa \in \{\kappa_1,\dots,\kappa_A\}$ which controls the amount of compute allocated at every decode step. The base LLM weights are unchanged. This turns inference efficiency optimization into a sequential decision problem. We show that a learned controller can allocate dense context when it matters and sparse context when it does not, meeting a specified budget while preserving quality. We also demonstrate that the policy can learn to jointly optimize for quantization, sparsity and pruning. Self-Optimizing Language Models (SOL) are able to learn to consistently out-perform static budget-allocation strategies (96\% win-rate) using the models own hidden-states, opening up an orthogonal axes of efficiency optimization previously under-studied.
 
 
