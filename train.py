@@ -769,6 +769,7 @@ def train_one_epoch_grpo(tok,
                     global_step_state["ema_cost_pru"] = mean_prune_obs
                 else:
                     global_step_state["ema_cost_pru"] = ema_beta * global_step_state["ema_cost_pru"] + (1 - ema_beta) * mean_prune_obs
+
                 gap_pru = float(global_step_state["ema_cost_pru"]) - (C_pru + tol_pru)
                 new_lam_pru = float(global_step_state["lambda_prune"]) + lr_pru * gap_pru
                 global_step_state["lambda_prune"] = float(max(0.0, min(lambda_max, new_lam_pru)))
@@ -786,6 +787,7 @@ def train_one_epoch_grpo(tok,
                     global_step_state["ema_cost_q"] = mean_qratio_obs
                 else:
                     global_step_state["ema_cost_q"] = ema_beta * global_step_state["ema_cost_q"] + (1 - ema_beta) * mean_qratio_obs
+
                 gap_q = float(global_step_state["ema_cost_q"]) - (C_q + tol_q)
                 new_lam_q = float(global_step_state["lambda_quant"]) + lr_q * gap_q
                 global_step_state["lambda_quant"] = float(max(0.0, min(lambda_max, new_lam_q)))

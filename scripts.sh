@@ -13,4 +13,4 @@ python gen_policy_vs_dense.py \
 
 torchrun --nproc_per_node=1 --master_port 29510 train.py   \
   --wandb_project SOL     --wandb_run_name RL_LCE_Quest4    \
-   --config /home/ya255/rl4e/official_configs/RL_LCE_Quest4.yml
+   --config /home/ya255/SOL/official_configs/RL_LCE_Quest4.yml
