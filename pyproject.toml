@@ -1,0 +1,38 @@
+[project]
+name = "rl4e"
+version = "0.1.0"
+description = "On-policy RL controller for adaptive attention sparsity (Qwen/Llama)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "transformers>=4.44",
+  "accelerate>=0.33",
+  "datasets>=2.19",
+  "torch>=2.4",
+  "safetensors>=0.4.5",
+  "tqdm>=4.66",
+  "rich>=13.7",
+]
+
+[project.optional-dependencies]
+quant = ["bitsandbytes>=0.43.0; platform_system != 'Windows'"]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+# Tell uv: don't try to build/install this repo as a package.
+# uv will therefore only install dependencies and ignore the build system
+package = false
+
+# torch index settings (leave as you had them)
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+
