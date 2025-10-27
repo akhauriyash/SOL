@@ -159,6 +159,11 @@ def train_one_epoch_grpo(tok,
         quant_choices=getattr(cfg, "quant_choices", ("q16",)),
     )
     A = action_spec.n_actions
+    # Normalize pruning to a 0..1 ratio for all constraint math (model still receives raw values)
+    P_MAX = float(max(action_spec.prune_keep)) if len(action_spec.prune_keep) > 0 else 1.0
+    has_prune_dof = len(action_spec.prune_keep) > 1
+    has_quant_dof = len(action_spec.q_bits) > 1
+
     KEEP_TOKEN = torch.tensor(action_spec.token_keep, device=device, dtype=torch.float32)
     KEEP_PRUNE = torch.tensor(action_spec.prune_keep, device=device, dtype=torch.float32)
     Q_BITS     = torch.tensor(action_spec.q_bits,     device=device, dtype=torch.int64)
@@ -448,7 +453,8 @@ def train_one_epoch_grpo(tok,
             keep_chosen_sum += kappa_now[eff_mask].sum()
             cost_eff_sum += cost_t_eff.sum()
             eff_tok += eff.sum()
-            agg_prune_sum  += float((prune_now * eff).sum().item())
+            # Accumulate normalized prune ratio (0..1) for budget tracking
+            agg_prune_sum  += float(((prune_now / P_MAX) * eff).sum().item())
             agg_qratio_sum += float((q_ratio   * eff).sum().item())
             agg_tok_steps  += float(eff.sum().item())
 
@@ -523,7 +529,8 @@ def train_one_epoch_grpo(tok,
 
         sum_eff_seq    = eff_all.sum(dim=0).clamp_min(1.0)               # [BK]
         mean_keep_seq  = (eff_all * keep_all).sum(dim=0) / sum_eff_seq   # [BK]
-        mean_prune_seq = (eff_all * prune_all).sum(dim=0) / sum_eff_seq   # [BK]
+        prune_all_ratio = prune_all / P_MAX
+        mean_prune_seq = (eff_all * prune_all_ratio).sum(dim=0) / sum_eff_seq   # [BK]
         mean_qratio_seq= (eff_all * qratio_all).sum(dim=0) / sum_eff_seq  # [BK]
         alpha_c = float(getattr(cfg, "cost_tradeoff_alpha", 1.0))
 
@@ -542,11 +549,15 @@ def train_one_epoch_grpo(tok,
                             torch.tensor(0.0, device=device))
 
         dev_tok = eff_all * (keep_all - C_tok)                              # [T, BK]
-        dev_pru = eff_all * (prune_all  - C_pru)                            # [T, BK]
+        dev_pru = eff_all * (prune_all_ratio  - C_pru)                      # [T, BK]
         dev_q   = eff_all * (qratio_all - C_q)                              # [T, BK]
         lam_tok = float(global_step_state.get("lambda_keep",  0.0))
         lam_pru = float(global_step_state.get("lambda_prune", 0.0))
         lam_q   = float(global_step_state.get("lambda_quant", 0.0))
+        if not has_prune_dof:
+            lam_pru = 0.0
+        if not has_quant_dof:
+            lam_q = 0.0
         adv = (adv_r
                - alpha_c * lam_tok * d_tok.view(1, -1) * s_tok.view(1, -1) * dev_tok
                - alpha_c * lam_pru * d_pru.view(1, -1) * s_pru.view(1, -1) * dev_pru
@@ -752,7 +763,7 @@ def train_one_epoch_grpo(tok,
                         "observe/budget_violation_end_token": max(gap_tok, 0.0),
                         "update_step": global_step_state["update"],
                     })
-            if agg_tok_steps > 0:
+            if has_prune_dof and agg_tok_steps > 0:
                 mean_prune_obs = agg_prune_sum / agg_tok_steps
                 if "ema_cost_pru" not in global_step_state:
                     global_step_state["ema_cost_pru"] = mean_prune_obs
@@ -769,7 +780,7 @@ def train_one_epoch_grpo(tok,
                         "observe/budget_violation_end_prune": max(gap_pru, 0.0),
                         "update_step": global_step_state["update"],
                     })
-            if agg_tok_steps > 0:
+            if has_quant_dof and agg_tok_steps > 0:
                 mean_qratio_obs = agg_qratio_sum / agg_tok_steps
                 if "ema_cost_q" not in global_step_state:
                     global_step_state["ema_cost_q"] = mean_qratio_obs
