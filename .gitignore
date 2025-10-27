@@ -2,7 +2,7 @@ block_cache/
 cache/
 checkpoints/
 ckpt_perplexities.csv
-
+wandb/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
