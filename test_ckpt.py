@@ -34,8 +34,8 @@ sdp.enable_mem_efficient_sdp(True)  # SDPA only
 @dataclass
 class EvalCfg:
     CKPT_DIR: str = "/home/ya255/rl4e/checkpoints/GRPO_DKL_Relv-20251017-002523/"
-    eval_batches: Optional[int] = None   # None = run full loader
-    split: str = "validation"           # typically "validation"
+    eval_batches: Optional[int] = None
+    split: str = "validation"
     mode: str = "latest" # "latest" or "best" (if best.pt exists)
     # dataset_name: Optional[str] = "wikitext"
     # dataset_config: Optional[str] = "wikitext-2-raw-v1"
@@ -81,18 +81,14 @@ def load_cfg_from_checkpoint_or_yaml(
     Then apply only dataset-related overrides.
     """
     cfg = Config()
-    # Try the checkpoint-embedded config first
     sd_cpu = torch.load(ckpt_path, map_location="cpu")
     sd_cfg = sd_cpu.get("cfg")
     if sd_cfg:
-        # Source of truth: resolved training config from checkpoint
-        # (covers Ts/Tw, keep_fracs, context_len, rollout_len, etc.)
         print("[eval] Using training config embedded in checkpoint.")
         for k, v in sd_cfg.items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
     else:
-        # Fallback: read base YAML from meta -> ckpt_dir/code/<relpath>
         meta = sd_cpu.get("meta", None)
         if meta is None:
             meta_path = os.path.join(ckpt_dir, "train_meta.json")
@@ -104,7 +100,6 @@ def load_cfg_from_checkpoint_or_yaml(
         base_rel = None
         if meta is not None:
             base_rel = meta.get("config_paths", {}).get("base")
-            # For visibility, print what we found
             kind = meta.get("kind", "unknown")
             print(f"[eval] meta.kind={kind}")
             print(f"[eval] meta.config_paths={meta.get('config_paths', {})}")
@@ -155,7 +150,6 @@ if args.mode is not None:
     E.mode = args.mode
 if args.dataset_name is not None:
     E.dataset_name = args.dataset_name
-    # keep dataset_config in sync with dataset_name
     E.dataset_config = "wikitext-2-raw-v1" if args.dataset_name == "wikitext" else "en"
 if args.sparsity_bias is not None:
     E.sparsity_bias = args.sparsity_bias
@@ -168,7 +162,6 @@ set_seed(E.seed)
 ckpt_path = find_latest_ckpt(E.CKPT_DIR, E.mode)
 if ckpt_path is None:
     raise FileNotFoundError(f"No checkpoint found in {E.CKPT_DIR}")
-# Build cfg from the training sources, then apply dataset-only overrides
 cfg = load_cfg_from_checkpoint_or_yaml(
     ckpt_dir=E.CKPT_DIR,
     ckpt_path=ckpt_path,
@@ -186,13 +179,10 @@ cfg.eval_prune_bias = float(getattr(E, "prune_bias", getattr(cfg, "eval_prune_bi
 if args.criteria is not None:
     cfg.sparsity_criteria = args.criteria
 
-# Load model & tokenizer exactly like training
 tok, model = load_lm_and_tokenizer(cfg)
 
-# Validation loader (streaming) using the same code path as training
 dl = make_dataloader(cfg, tok, split=E.split, shuffle=False, distributed=False)
 
-# Prepare policy and load checkpoint
 base_model = unwrap(model)
 hidden_size = getattr(base_model.config, "hidden_size", getattr(base_model.config, "n_embd", None))
 if hidden_size is None:
@@ -218,7 +208,7 @@ if sd_cfg is not None and "keep_fracs" in sd_cfg:
 emb_layer = unwrap(model).get_input_embeddings()
 embed_dim = getattr(emb_layer, "embedding_dim", emb_layer.weight.shape[1])
 in_dim = int(hidden_size + embed_dim + 1)
-# === Recurrent policy hyperparams (defaults; can be overridden in cfg) ===
+
 pol_d_model  = int(getattr(cfg, "policy_d_model", 768))
 pol_heads    = int(getattr(cfg, "policy_n_heads", 8))
 pol_layers   = int(getattr(cfg, "policy_n_layers", 2))
@@ -235,7 +225,6 @@ spec = build_action_spec(
     prune_choices=cfg.struct_prune_choices,
     quant_choices=cfg.quant_choices,
 )
-# policy = ActorCriticPolicy(in_dim=in_dim, n_actions=len(cfg.keep_fracs)).to(cfg.device, dtype=torch.float32)
 policy = RecurrentActorCriticPolicy(
     h_dim=int(hidden_size),
     e_dim=int(embed_dim),
@@ -261,10 +250,6 @@ print(f"Structure: Ts={cfg.Ts}  Tw={cfg.Tw}  keep_fracs={cfg.keep_fracs}")
 print(f"context_len={cfg.context_len} rollout_len={cfg.rollout_len}")
 print(f"RL policy eval settings: greedy={E.greedy}, temperature={E.policy_temperature}")
 
-# cfg.sparsity_criteria = "quest"
-assert cfg.sparsity_criteria == "quest", "This eval script only supports 'quest' criteria. temporarily."
-
-# # ---- Run evaluations ----
 start_time = time.time()
 dense_full = evaluate_dense_full(
     model, limited_dl(make_dataloader(cfg, tok, split=E.split, shuffle=False, distributed=False), E.eval_batches),
@@ -275,12 +260,6 @@ print(f"Dense (full teacher)   \t\t: ppl={dense_full['ppl']:.3f}\ttokens={dense_
 print(f"Dense (full) evaluation complete in {total_time:.2f} seconds.")
 start_time = time.time()
 
-# keep_fracs=[0.99, 1.0],
-# prune_choices=("s100", "s99", "s98"),
-# quant_choices=("q16", "q16", "q16"),
-# cfg.keep_fracs = (0.2, 1.0)
-# cfg.struct_prune_choices = ("s100", "s80", "s40")
-# cfg.quant_choices = ("q4", "q8", "q16")
 greedy = evaluate_stateful_policy_rollout(
     cfg,
     model,
@@ -311,10 +290,6 @@ print(f"Policy Action Probs \t: {[f'{p:.3f}' for p in greedy['action_probs']]}")
 if args.tgt_keep is not None:
     greedy["avg_keep_effective"] = args.tgt_keep
 
-
-# target_prune = 0.6
-# target_qratio = 0.56
-
 target_prune = greedy["avg_prune_keep"]
 target_qratio = greedy["avg_quant_ratio"]
 
@@ -334,7 +309,7 @@ fixed_matched = evaluate_fixed_matched_keep(
     context_len=cfg.context_len,
     rollout_len=cfg.rollout_len,
     device=cfg.device,
-    struct_on_non_eff=False,   # set True if your training budgets used all steps
+    struct_on_non_eff=False,
 )
 total_time = time.time() - start_time
 print(
@@ -347,24 +322,27 @@ print(
 print(f"Fixed matched evaluation complete in {total_time:.2f} seconds.")
 print(f"Fixed Action Probs \t: {[f'{p:.3f}' for p in fixed_matched['action_probs']]}")
 
-# start_time = time.time()
-# cfg.probe_metric = "dense_kl"
-# teacher_matched = evaluate_sft_teacher_matched_keep(
-#     cfg,
-#     model,
-#     limited_dl(make_dataloader(cfg, tok, split=E.split, shuffle=False, distributed=False), E.eval_batches),
-#     Ts=cfg.Ts, Tw=cfg.Tw, keep_fracs=cfg.keep_fracs,
-#     target_keep_effective=greedy["avg_keep_effective"],
-#     context_len=cfg.context_len, rollout_len=cfg.rollout_len, device=cfg.device
-# )
-# total_time = time.time() - start_time
-# print(
-#     f"\nSFT teacher (matched keep) \t: ppl={teacher_matched['ppl']:.3f}  "
-#     f"keep_all={teacher_matched['avg_keep_all']:.3f}  "
-#     f"keep_eff={teacher_matched['avg_keep_effective']:.3f}\t"
-#     f"tokens={teacher_matched['tokens_effective']}/{teacher_matched['tokens']}\n"
-# )
-# print(f"SFT teacher (matched keep) evaluation complete in {total_time:.2f} seconds.")
+try:
+    start_time = time.time()
+    cfg.probe_metric = "dense_kl"
+    teacher_matched = evaluate_sft_teacher_matched_keep(
+        cfg,
+        model,
+        limited_dl(make_dataloader(cfg, tok, split=E.split, shuffle=False, distributed=False), E.eval_batches),
+        Ts=cfg.Ts, Tw=cfg.Tw, keep_fracs=cfg.keep_fracs,
+        target_keep_effective=greedy["avg_keep_effective"],
+        context_len=cfg.context_len, rollout_len=cfg.rollout_len, device=cfg.device
+    )
+    total_time = time.time() - start_time
+    print(
+        f"\nSFT teacher (matched keep) \t: ppl={teacher_matched['ppl']:.3f}  "
+        f"keep_all={teacher_matched['avg_keep_all']:.3f}  "
+        f"keep_eff={teacher_matched['avg_keep_effective']:.3f}\t"
+        f"tokens={teacher_matched['tokens_effective']}/{teacher_matched['tokens']}\n"
+    )
+    print(f"SFT teacher (matched keep) evaluation complete in {total_time:.2f} seconds.")
+except:
+    print("Skipping SFT Teacher, may have failed due to pruning/quantization in action space")
 start_time = time.time()
 rand_matched = evaluate_randomized_matched_sparsity(
     cfg,
@@ -378,7 +356,7 @@ rand_matched = evaluate_randomized_matched_sparsity(
     target_prune_keep=target_prune,
     target_quant_ratio=target_qratio,
     context_len=cfg.context_len, rollout_len=cfg.rollout_len, device=cfg.device,
-    struct_on_non_eff=False,   # True if your training budget for ρ/q counted all steps
+    struct_on_non_eff=False,
 )
 total_time = time.time() - start_time
 print(
@@ -390,55 +368,55 @@ print(
 )
 print(f"Randomized matched evaluation complete in {total_time:.2f} seconds.")
 print(f"Random Action Probs \t: {[f'{p:.3f}' for p in rand_matched['action_probs']]}")
-# start_time = time.time()
-# drift_aware_matched = evaluate_drift_aware_matched_keep(
-#     cfg,
-#     model,
-#     limited_dl(make_dataloader(cfg, tok, split=E.split, shuffle=False, distributed=False), E.eval_batches),
-#     Ts=cfg.Ts, Tw=cfg.Tw,
-#     keep_fracs=cfg.keep_fracs,
-#     target_keep_effective=greedy["avg_keep_effective"],
-#     prune_choices=getattr(cfg, "struct_prune_choices", ("s100",)),
-#     quant_choices=getattr(cfg, "quant_choices", ("q16",)),
-#     target_prune_keep=getattr(cfg, "C_target_prune", 1.0),
-#     target_quant_ratio=float(getattr(cfg, "C_target_quant_bits", 16)) / 16.0,
-#     context_len=cfg.context_len, rollout_len=cfg.rollout_len, device=cfg.device,
-#     struct_on_non_eff=False,   # True if your training budget for ρ/q counted all steps
-# )
-# total_time = time.time() - start_time
-# print(
-#     f"\nDrift-aware (matched keep) \t: ppl={drift_aware_matched['ppl']:.3f}  "
-#     f"keep_all={drift_aware_matched['avg_keep_all']:.3f}  "
-#     f"keep_eff={drift_aware_matched['avg_keep_effective']:.3f}\t"
-#     f"tokens={drift_aware_matched['tokens_effective']}/{drift_aware_matched['tokens']}\n"
-# )
-# print(f"Drift-aware Action Probs \t: {[f'{p:.3f}' for p in drift_aware_matched['action_probs']]}")
+start_time = time.time()
+drift_aware_matched = evaluate_drift_aware_matched_keep(
+    cfg,
+    model,
+    limited_dl(make_dataloader(cfg, tok, split=E.split, shuffle=False, distributed=False), E.eval_batches),
+    Ts=cfg.Ts, Tw=cfg.Tw,
+    keep_fracs=cfg.keep_fracs,
+    target_keep_effective=greedy["avg_keep_effective"],
+    prune_choices=getattr(cfg, "struct_prune_choices", ("s100",)),
+    quant_choices=getattr(cfg, "quant_choices", ("q16",)),
+    target_prune_keep=getattr(cfg, "C_target_prune", 1.0),
+    target_quant_ratio=float(getattr(cfg, "C_target_quant_bits", 16)) / 16.0,
+    context_len=cfg.context_len, rollout_len=cfg.rollout_len, device=cfg.device,
+    struct_on_non_eff=False,
+)
+total_time = time.time() - start_time
+print(
+    f"\nDrift-aware (matched keep) \t: ppl={drift_aware_matched['ppl']:.3f}  "
+    f"keep_all={drift_aware_matched['avg_keep_all']:.3f}  "
+    f"keep_eff={drift_aware_matched['avg_keep_effective']:.3f}\t"
+    f"tokens={drift_aware_matched['tokens_effective']}/{drift_aware_matched['tokens']}\n"
+)
+print(f"Drift-aware Action Probs \t: {[f'{p:.3f}' for p in drift_aware_matched['action_probs']]}")
 
-# print(f"Drift-aware matched evaluation complete in {total_time:.2f} seconds.")
-# start_time = time.time()
-# emc_matched = evaluate_emc_matched_keep(
-#     cfg,
-#     model,
-#     limited_dl(make_dataloader(cfg, tok, split=E.split, shuffle=False, distributed=False), E.eval_batches),
-#     Ts=cfg.Ts, Tw=cfg.Tw,
-#     keep_fracs=cfg.keep_fracs,
-#     target_keep_effective=greedy["avg_keep_effective"],
-#     prune_choices=getattr(cfg, "struct_prune_choices", ("s100",)),
-#     quant_choices=getattr(cfg, "quant_choices", ("q16",)),
-#     target_prune_keep=getattr(cfg, "C_target_prune", 1.0),
-#     target_quant_ratio=float(getattr(cfg, "C_target_quant_bits", 16)) / 16.0,
-#     context_len=cfg.context_len, rollout_len=cfg.rollout_len, device=cfg.device,
-#     struct_on_non_eff=False,   # True if your training budget for ρ/q counted all steps
-# )
-# total_time = time.time() - start_time
-# print(
-#     f"\nEMC (matched keep) \t: ppl={emc_matched['ppl']:.3f}  "
-#     f"keep_all={emc_matched['avg_keep_all']:.3f}  "
-#     f"keep_eff={emc_matched['avg_keep_effective']:.3f}\t"
-#     f"tokens={emc_matched['tokens_effective']}/{emc_matched['tokens']}\n"
-# )
-# print(f"EMC Action Probs \t: {[f'{p:.3f}' for p in emc_matched['action_probs']]}")
-# print(f"EMC matched evaluation complete in {total_time:.2f} seconds.")
+print(f"Drift-aware matched evaluation complete in {total_time:.2f} seconds.")
+start_time = time.time()
+emc_matched = evaluate_emc_matched_keep(
+    cfg,
+    model,
+    limited_dl(make_dataloader(cfg, tok, split=E.split, shuffle=False, distributed=False), E.eval_batches),
+    Ts=cfg.Ts, Tw=cfg.Tw,
+    keep_fracs=cfg.keep_fracs,
+    target_keep_effective=greedy["avg_keep_effective"],
+    prune_choices=getattr(cfg, "struct_prune_choices", ("s100",)),
+    quant_choices=getattr(cfg, "quant_choices", ("q16",)),
+    target_prune_keep=getattr(cfg, "C_target_prune", 1.0),
+    target_quant_ratio=float(getattr(cfg, "C_target_quant_bits", 16)) / 16.0,
+    context_len=cfg.context_len, rollout_len=cfg.rollout_len, device=cfg.device,
+    struct_on_non_eff=False,
+)
+total_time = time.time() - start_time
+print(
+    f"\nEMC (matched keep) \t: ppl={emc_matched['ppl']:.3f}  "
+    f"keep_all={emc_matched['avg_keep_all']:.3f}  "
+    f"keep_eff={emc_matched['avg_keep_effective']:.3f}\t"
+    f"tokens={emc_matched['tokens_effective']}/{emc_matched['tokens']}\n"
+)
+print(f"EMC Action Probs \t: {[f'{p:.3f}' for p in emc_matched['action_probs']]}")
+print(f"EMC matched evaluation complete in {total_time:.2f} seconds.")
 
 
 
@@ -451,12 +429,15 @@ print(
     f"keep_eff={greedy['avg_keep_effective']:.3f}\t"
     f"tokens={greedy['tokens_effective']}/{greedy['tokens']}"
 )
-# print(
-#     f"SFT teacher (matched keep) \t: ppl={teacher_matched['ppl']:.3f}  "
-#     f"keep_all={teacher_matched['avg_keep_all']:.3f}  "
-#     f"keep_eff={teacher_matched['avg_keep_effective']:.3f}\t"
-#     f"tokens={teacher_matched['tokens_effective']}/{teacher_matched['tokens']}"
-# )
+try:
+    print(
+        f"SFT teacher (matched keep) \t: ppl={teacher_matched['ppl']:.3f}  "
+        f"keep_all={teacher_matched['avg_keep_all']:.3f}  "
+        f"keep_eff={teacher_matched['avg_keep_effective']:.3f}\t"
+        f"tokens={teacher_matched['tokens_effective']}/{teacher_matched['tokens']}"
+    )
+except:
+    print("Skipping SFT Teacher, may have failed due to pruning/quantization in action space")
 print(
     f"Random (matched keep)  \t\t: ppl={rand_matched['ppl']:.3f}  "
     f"keep_all={rand_matched['avg_keep_all']:.3f}  "
@@ -469,18 +450,18 @@ print(
     f"keep_eff={fixed_matched['avg_keep_effective']:.3f}\t"
     f"tokens={fixed_matched['tokens_effective']}/{fixed_matched['tokens']}"
 )
-# print(
-#     f"Drift-aware (matched keep) \t: ppl={drift_aware_matched['ppl']:.3f}  "
-#     f"keep_all={drift_aware_matched['avg_keep_all']:.3f}  "
-#     f"keep_eff={drift_aware_matched['avg_keep_effective']:.3f}\t"
-#     f"tokens={drift_aware_matched['tokens_effective']}/{drift_aware_matched['tokens']}"
-# )
-# print(
-#     f"EMC (matched keep) \t: ppl={emc_matched['ppl']:.3f}  "
-#     f"keep_all={emc_matched['avg_keep_all']:.3f}  "
-#     f"keep_eff={emc_matched['avg_keep_effective']:.3f}\t"
-#     f"tokens={emc_matched['tokens_effective']}/{emc_matched['tokens']}"
-# )
+print(
+    f"Drift-aware (matched keep) \t: ppl={drift_aware_matched['ppl']:.3f}  "
+    f"keep_all={drift_aware_matched['avg_keep_all']:.3f}  "
+    f"keep_eff={drift_aware_matched['avg_keep_effective']:.3f}\t"
+    f"tokens={drift_aware_matched['tokens_effective']}/{drift_aware_matched['tokens']}"
+)
+print(
+    f"EMC (matched keep) \t: ppl={emc_matched['ppl']:.3f}  "
+    f"keep_all={emc_matched['avg_keep_all']:.3f}  "
+    f"keep_eff={emc_matched['avg_keep_effective']:.3f}\t"
+    f"tokens={emc_matched['tokens_effective']}/{emc_matched['tokens']}"
+)
 
 print(
     f"\n\nRandom mix details     \t\t: low_k={rand_matched['mix_lo_k']:.2f}, "
@@ -544,3 +525,8 @@ with open(csv_path, "a", newline="") as f:
     writer.writerow(row)
 
 print(f"[csv] Appended results to {csv_path}")
+
+print("="*50)
+print("Please note that SFT Teacher, Drift-Aware and EMC do not do pruning or quantization")
+print("Thus, their results may not be directly comparable to Policy, Random, and Fixed methods.")
+print("="*50)

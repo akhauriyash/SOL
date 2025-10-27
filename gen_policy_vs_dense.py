@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
 """
-gen_policy_vs_dense.py
-
-Minimal, no-lm-eval script to sanity-check continuous generation from:
-  1) Policy-controlled sparse decoding (episodic refresh)
-  2) Dense baseline (no policy, no sparse masks)
-
-Requires your repo modules and eval_policy_lmeval.PolicyHarnessLM.
-
 Example:
   python gen_policy_vs_dense.py \
     --ckpt_dir /path/to/ckpts \
@@ -15,19 +7,14 @@ Example:
     --generation_tokens 256 \
     --temperature 0.0
 
-Notes:
-- Uses the same tokenizer/model/policy loading as your eval script.
-- Prints just the continuations (not the prompt) for easy visual compare.
 """
 
 import argparse
 import random
 import numpy as np
+from pprint import pprint
 import torch
-
-# Pull the existing, battle-tested wrapper & runner from your provided file.
-# This keeps the script tiny and avoids duplicating logic.
-from eval_policy_lmeval import PolicyHarnessLM  # noqa: E402
+from eval_policy_lmeval import PolicyHarnessLM
 import torch, torch.nn.functional as F
 
 def avg_ll_under_dense(dense_model: PolicyHarnessLM, prompt: str, continuation: str) -> float:
@@ -40,14 +27,12 @@ def avg_ll_under_dense(dense_model: PolicyHarnessLM, prompt: str, continuation: 
     device = dense_model.runner.device
     m = dense_model.runner.m
 
-    # one pass over prompt+continuation
     full = torch.tensor([ctx_ids + cont_ids], device=device)
     with torch.no_grad():
         out = m(input_ids=full, return_dict=True)
-        # logits at positions that predict the continuation tokens
-        start = len(ctx_ids) - 1                     # position that predicts cont[0]
-        end = start + len(cont_ids)                  # exclusive
-        logits = out.logits[:, start:end, :]         # [1, len(cont), V]
+        start = len(ctx_ids) - 1
+        end = start + len(cont_ids)
+        logits = out.logits[:, start:end, :]
 
         targets = torch.tensor([cont_ids], device=device)
         logprobs = F.log_softmax(logits, dim=-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
@@ -63,6 +48,26 @@ def set_seed(seed: int | None):
         torch.cuda.manual_seed_all(seed)
 
 
+def generate_once_policy(
+    model: PolicyHarnessLM,
+    prompt: str,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float | None,
+    top_k: int | None,
+) -> str:
+    ctx_ids = model.tok.encode(prompt, add_special_tokens=False)
+    gen_ids = model.runner.generate_with_policy(
+        ctx_ids=ctx_ids,
+        max_new_tokens=max_new_tokens,
+        until=None,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        return_stats=True,
+    )
+    return model.tok.decode(gen_ids[0], skip_special_tokens=True), gen_ids[1]
+
 def generate_once(
     model: PolicyHarnessLM,
     prompt: str,
@@ -71,7 +76,6 @@ def generate_once(
     top_p: float | None,
     top_k: int | None,
 ) -> str:
-    """Generate a single continuation using the already-initialized model."""
     ctx_ids = model.tok.encode(prompt, add_special_tokens=False)
     gen_ids = model.runner.generate_with_policy(
         ctx_ids=ctx_ids,
@@ -103,10 +107,8 @@ def main():
     p.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature for generation")
     p.add_argument("--top_p", type=float, default=None, help="Top-p nucleus filtering (optional)")
     p.add_argument("--top_k", type=int, default=None, help="Top-k filtering (optional)")
-
-    # Policy controls (mirrors your original defaults/knobs)
     p.add_argument("--policy_temperature", type=float, default=0.6, help="Temperature for policy action selection")
-    # Default greedy; allow flipping to stochastic policy with --stochastic_policy
+
     g = p.add_mutually_exclusive_group()
     g.add_argument("--greedy_policy", dest="greedy_policy", action="store_true", help="Use argmax for κ actions")
     g.add_argument("--stochastic_policy", dest="greedy_policy", action="store_false", help="Sample κ actions")
@@ -120,7 +122,6 @@ def main():
     args = p.parse_args()
     set_seed(args.seed)
 
-    # Load the policy-driven model (sparse path)
     policy_model = PolicyHarnessLM(
         ckpt_dir=args.ckpt_dir,
         mode=args.mode,
@@ -132,14 +133,13 @@ def main():
         max_batch=args.batch_size,
     )
 
-    # Load a dense-only baseline model (same weights/tokenizer, no policy/masks)
     dense_model = PolicyHarnessLM(
         ckpt_dir=args.ckpt_dir,
         mode=args.mode,
-        greedy_policy=True,  # ignored in dense mode
-        policy_temperature=args.policy_temperature,  # ignored in dense mode
-        episode_len=args.episode_len,               # ignored in dense mode
-        dense_refresh_tail=args.dense_refresh_tail, # ignored in dense mode
+        greedy_policy=True,
+        policy_temperature=args.policy_temperature,
+        episode_len=args.episode_len,
+        dense_refresh_tail=args.dense_refresh_tail,
         dense_only=True,
         max_batch=args.batch_size,
     )
@@ -150,8 +150,7 @@ def main():
     print(prompt)
     print("\n============================")
 
-    # Policy (sparse) generation
-    policy_text = generate_once(
+    policy_text, stats = generate_once_policy(
         policy_model,
         prompt=prompt,
         max_new_tokens=args.generation_tokens,
@@ -160,7 +159,6 @@ def main():
         top_k=args.top_k,
     )
 
-    # Dense baseline generation
     dense_text = generate_once(
         dense_model,
         prompt=prompt,
@@ -170,7 +168,6 @@ def main():
         top_k=args.top_k,
     )
 
-    # Show results
     print("\n--- Policy (sparse) continuation ---\n")
     print(policy_text)
     print(f"\n[chars: {len(policy_text)}]")
@@ -181,6 +178,8 @@ def main():
     policy_ll = avg_ll_under_dense(dense_model, prompt, policy_text)
     dense_ll  = avg_ll_under_dense(dense_model, prompt, dense_text)
     print(f"Mean logprob under dense LM -> policy: {policy_ll:.4f}, dense: {dense_ll:.4f}")
+
+    pprint(stats)
 
 if __name__ == "__main__":
     main()
