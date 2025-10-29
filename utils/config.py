@@ -39,8 +39,7 @@ class Config:
     eval_sparsity_bias: float = 0.0
     quest_page_size: int = 16
 
-    # PPO or GRPO
-    algo: str = "ppo"            # or "grpo"
+    algo: str = "grpo"
     reward_agg: str = None  # "mean" or "sum"
     grpo_quality_topq: Optional[float] = None  # if set, use quality-first GRPO with top-q fraction, otherwise lambda controller.
     grpo_rollouts_per_input: int = 16
@@ -49,7 +48,10 @@ class Config:
     grpo_norm: str = "center"    # "center" or "zscore"
     adv_whiten_global: bool = True
     kl_pi_ref_coef: float = 0.0  # turn on if you want π vs π_ref regularization
-
+    reward_gamma: float = 0.82
+    tol_token: float = 0.01
+    tol_prune: float = 0.01
+    tol_quant_bits: float = 0.01
     # --- Sparse attention controls used by train_one_epoch_ppo ---
     Ts: int = 4                      # number of "sinks"
     Tw: int = 1                      # trailing dense window
@@ -63,9 +65,12 @@ class Config:
     keep_target: float = 0.3         # budget target (a.k.a. C_target)
     # Optional explicit alias; if None, code falls back to keep_target
     C_target: Optional[float] = None
-    sparsity_criteria: str = "recency"   # "recency" | "relevancy"
+    sparsity_criteria: str = "recency"   # "recency" | "relevancy" | "quest"
     relevancy_tier: str = "per_head"     # "per_head" | "per_layer"
 
+    enable_prune_quant: bool = False
+    C_target_prune: Optional[float] = None      # if set, overrides keep_target for pruning budget
+    C_target_quant_bits: Optional[int] = None   # e.g., 16, 8, 4; None -> derive from quant_choices
     # --- Sequence lengths / batching ---
     context_len: int = 512           # dense prefill length
     rollout_len: int = 16            # on-policy window length

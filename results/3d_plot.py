@@ -3,11 +3,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 
-CSV_PATH = "multi_eff_ppl_scan.csv"
+CSV_PATH = "multi_eff_ppl_scan_v2.csv"
 
-OUT_ENVELOPE = "edc_envelope.png"
-OUT_PLANES   = "delta_planes.pdf"
-OUT_DELTA_EDC = "delta_vs_edc.pdf"
+OUT_ENVELOPE = "edc_envelope_v2.png"
+OUT_PLANES   = "delta_planes_v2.pdf"
+OUT_DELTA_EDC = "delta_vs_edc_v2.pdf"
 
 W_ATTN = 0.5
 W_MLP  = 0.5
@@ -360,7 +360,8 @@ else:
     fig.subplots_adjust(right=0.98)
     plt.savefig("policy_action_histogram.pdf", bbox_inches="tight")
     print("Saved policy_action_histogram.pdf")
-    print(f"Win-rate @ EDC<0.9: {100*np.mean((df['policy_ppl'] < df['fixed_ppl'])[edc_policy < 0.9]):.1f}%")
+    edrate = 0.95
+    print(f"Win-rate @ EDC<{edrate}: {100*np.mean((df['policy_ppl'] < df['fixed_ppl'])[edc_policy < edrate]):.1f}%")
 
 
 

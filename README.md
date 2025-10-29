@@ -13,6 +13,8 @@ Key config controllers:
 ```yaml
 model_name: meta-llama/Llama-3.2-1B
 "algo": "grpo",                                    # grpo / sft
+"reward_agg": null,                                # set to sum for hybrid rewards
+"reward_gamma": 0.92,                              # controls the recency.
 "sparsity_criteria": "quest",                      # token-sparsity method (recency / relevancy / quest)
 "quest_page_size": 8,                              # page-size for quest token-sparsity
 "keep_fracs": [0.2, 1.0],                          # keep fractions for token sparsity (1.0: keep everything)
@@ -39,14 +41,14 @@ Launch training with `torchrun` (or `python`) once a config file is prepared:
 torchrun --nproc_per_node=1 --master_port 29510 train.py \
   --wandb_project SOL \
   --wandb_run_name RL_LCE_Quest4    \
-  --config /home/ya255/rl4e/official_configs/RL_LCE_Quest4.yml
+  --config <base_path>/SOL/official_configs/RL_LCE_Quest4.yml
 ```
 
 ## Evaluation
 
 To evaluate on perplexity metrics, use
 ```
-python test_ckpt.py --ckpt_dir /home/ya255/SOL/checkpoints/RL_LCE_Quest8_PruneQuant-20251025-164022 \
+python test_ckpt.py --ckpt_dir <base_path>/SOL/checkpoints/RL_LCE_Quest8_PruneQuant-20251025-164022 \
   --mode "latest" --dataset_name wikitext --sparsity_bias 0.0 --prune_bias 0.0 --quant_bias 0.0
 ```
 
@@ -56,7 +58,7 @@ To compare generations from policy vs dense model, run the command below, with a
 
 ```
 python gen_policy_vs_dense.py \
-  --ckpt_dir /home/ya255/SOL/checkpoints/RL_LCE_Quest8_PruneQuant-20251025-164022 \
+  --ckpt_dir <base_path>/SOL/checkpoints/RL_LCE_Quest8_PruneQuant-20251025-164022 \
   --input_sentence "Place long text here " \
   --generation_tokens 256 \
   --temperature 0.6 --top_p 0.9 --sparsity_bias -8 --prune_bias -3 --quant_bias -5
@@ -65,7 +67,7 @@ python gen_policy_vs_dense.py \
 To evaluate on downstream tasks, run:
 
 ```
-python eval_policy_lmeval.py   --ckpt_dir /home/ya255/rl4e/checkpoints/RL_LCE_Rec-20251017-162206  \
+python eval_policy_lmeval.py   --ckpt_dir <base_path>/SOL/checkpoints/RL_LCE_Rec-20251017-162206  \
  --mode latest   --tasks hellaswag,squadv2,arc_easy,winogrande   --batch_size 8  \
    --episode_len 16 \
   --policy_temperature 0.6   --greedy_policy --dense_baseline --export_sparsity_json base_path.json 

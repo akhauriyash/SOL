@@ -79,15 +79,18 @@ for path, imgname in path_tuples:
     ax.plot(random["random_keep_all"], random["random_ppl"], marker="o", linewidth=2, markersize=6, label="Random")
     ax.plot(teacher["sft_teacher_keep_all"], teacher["sft_teacher_ppl"], marker="o", linewidth=2, markersize=6, label="Greedy Oracle")
 
-    ax.axhline(y=9.810783548925864, linestyle="--", linewidth=2, color="black", label="_nolegend_")
     ax.set_xlabel("Keep-Rate")
     ax.set_ylabel("Perplexity")
     if "p16" in imgname:
+        ax.axhline(y=9.810783548925864, linestyle="--", linewidth=2, color="black", label="_nolegend_")
         ax.set_xlim(left=0.35)
         ax.set_ylim(top=20)
     else:
+        ax.axhline(y=9.810783548925864, linestyle="--", linewidth=2, color="black", label="_nolegend_")
+        # ax.axhline(y=9.572114832340604, linestyle="--", linewidth=2, color="black", label="_nolegend_")
         ax.set_xlim(left=0.4)
         ax.set_ylim(top=10.2)
+        # ax.set_ylim(top=9.95)
     ax.grid(True, linewidth=0.5, alpha=0.5)
     ax.legend()
 

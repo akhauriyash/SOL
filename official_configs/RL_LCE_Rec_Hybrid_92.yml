@@ -2,7 +2,9 @@
   "model_name": "meta-llama/Llama-3.2-1B",
 
   "algo": "grpo",
-  "sparsity_criteria": "quest",
+  "sparsity_criteria": "recency",
+  "reward_agg": "sum",
+  "reward_gamma": 0.92,
   "quest_page_size": 4,
   "keep_fracs": [0.2, 1.0],
   "struct_prune_choices": ['s100'],

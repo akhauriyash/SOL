@@ -14,3 +14,23 @@ python gen_policy_vs_dense.py \
 torchrun --nproc_per_node=1 --master_port 29510 train.py   \
   --wandb_project SOL     --wandb_run_name RL_LCE_Quest4    \
    --config /home/ya255/SOL/official_configs/RL_LCE_Quest4.yml
+
+torchrun --nproc_per_node=1 --master_port 29511 train.py   \
+  --wandb_project SOL     --wandb_run_name RL_LCE_Quest8_PruneQuant    \
+   --config /home/ya255/SOL/official_configs/RL_LCE_Quest8_PruneQuant.yml
+   
+torchrun --nproc_per_node=1 --master_port 29512 train.py   \
+  --wandb_project SOL     --wandb_run_name RL_LCE_Rec    \
+   --config /home/ya255/SOL/official_configs/RL_LCE_Rec.yml
+
+torchrun --nproc_per_node=1 --master_port 29513 train.py   \
+  --wandb_project SOL     --wandb_run_name RL_LCE_Rec_Hybrid    \
+   --config /home/ya255/SOL/official_configs/RL_LCE_Rec_Hybrid.yml
+
+torchrun --nproc_per_node=1 --master_port 29514 train.py   \
+  --wandb_project SOL     --wandb_run_name RL_LCE_Rec_Hybrid_92    \
+   --config /home/ya255/SOL/official_configs/RL_LCE_Rec_Hybrid_92.yml
+
+torchrun --nproc_per_node=1 --master_port 29515 train.py   \
+  --wandb_project SOL     --wandb_run_name RL_LCE_Rec_Outc    \
+   --config /home/ya255/SOL/official_configs/RL_LCE_Rec_Outc.yml

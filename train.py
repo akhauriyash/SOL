@@ -161,8 +161,9 @@ def train_one_epoch_grpo(tok,
     A = action_spec.n_actions
     # Normalize pruning to a 0..1 ratio for all constraint math (model still receives raw values)
     P_MAX = float(max(action_spec.prune_keep)) if len(action_spec.prune_keep) > 0 else 1.0
-    has_prune_dof = len(action_spec.prune_keep) > 1
-    has_quant_dof = len(action_spec.q_bits) > 1
+
+    has_prune_dof = len(set(action_spec.prune_keep)) > 1
+    has_quant_dof = len(set(action_spec.q_bits)) > 1
 
     KEEP_TOKEN = torch.tensor(action_spec.token_keep, device=device, dtype=torch.float32)
     KEEP_PRUNE = torch.tensor(action_spec.prune_keep, device=device, dtype=torch.float32)
@@ -1397,7 +1398,7 @@ def main():
         if distributed and isinstance(dl.sampler, DistributedSampler):
             dl.sampler.set_epoch(epoch)
 
-        TRAIN_FRACTION = 0.6
+        TRAIN_FRACTION = 0.4
         max_batches = max(1, int(len(dl) * TRAIN_FRACTION))
         dl_epoch = limited_dl(dl, max_batches)
 
