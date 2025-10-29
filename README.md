@@ -14,7 +14,7 @@ Key config controllers:
 model_name: meta-llama/Llama-3.2-1B
 "algo": "grpo",                                    # grpo / sft
 "reward_agg": null,                                # set to sum for hybrid rewards
-"reward_gamma": 0.92,                              # controls the recency.
+"reward_gamma": 0.92,                              # controls the inverse-cumulative weight for hybrid reward
 "sparsity_criteria": "quest",                      # token-sparsity method (recency / relevancy / quest)
 "quest_page_size": 8,                              # page-size for quest token-sparsity
 "keep_fracs": [0.2, 1.0],                          # keep fractions for token sparsity (1.0: keep everything)
