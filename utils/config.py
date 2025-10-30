@@ -52,6 +52,14 @@ class Config:
     tol_token: float = 0.01
     tol_prune: float = 0.01
     tol_quant_bits: float = 0.01
+
+    lambda_lr_token: float = 0.5
+    lambda_lr_prune: float = 0.5
+    lambda_lr_quant: float = 0.5
+
+    lambda_init_token: float = 25.0
+    lambda_init_prune: float = 25.0
+    lambda_init_quant: float = 25.0
     # --- Sparse attention controls used by train_one_epoch_ppo ---
     Ts: int = 4                      # number of "sinks"
     Tw: int = 1                      # trailing dense window

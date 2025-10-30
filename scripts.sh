@@ -34,3 +34,11 @@ torchrun --nproc_per_node=1 --master_port 29514 train.py   \
 torchrun --nproc_per_node=1 --master_port 29515 train.py   \
   --wandb_project SOL     --wandb_run_name RL_LCE_Rec_Outc    \
    --config /home/ya255/SOL/official_configs/RL_LCE_Rec_Outc.yml
+
+torchrun --nproc_per_node=1 --master_port 29516 train.py   \
+  --wandb_project SOL     --wandb_run_name RL_LCE_Prune    \
+   --config /home/ya255/SOL/official_configs/RL_LCE_Prune.yml
+
+torchrun --nproc_per_node=1 --master_port 29517 train.py   \
+  --wandb_project SOL     --wandb_run_name RL_LCE_Quant    \
+   --config /home/ya255/SOL/official_configs/RL_LCE_Quant.yml

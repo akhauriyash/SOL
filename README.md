@@ -13,8 +13,8 @@ Key config controllers:
 ```yaml
 model_name: meta-llama/Llama-3.2-1B
 "algo": "grpo",                                    # grpo / sft
-"reward_agg": null,                                # set to sum for hybrid rewards
-"reward_gamma": 0.92,                              # controls the inverse-cumulative weight for hybrid reward
+
+## Efficiency related knobs
 "sparsity_criteria": "quest",                      # token-sparsity method (recency / relevancy / quest)
 "quest_page_size": 8,                              # page-size for quest token-sparsity
 "keep_fracs": [0.2, 1.0],                          # keep fractions for token sparsity (1.0: keep everything)
@@ -24,12 +24,20 @@ model_name: meta-llama/Llama-3.2-1B
 "C_target_prune": 0.70,                            # llm pruning target (keep-rate)
 "C_target_quant_bits": 9,                          # quantization target in bits
 "enable_prune_quant": true,                        # enable pruning and quantization optimization
-"grpo_level": "process",                           # process / outcome / hybrid
+## RL reward related knobs
 "task_w_kl": 0.0,                                  # 0.0 is LCE, 1.0 is DKL, can interpolate in between
-"horizon": 4,                                      # look-ahead for greedy oracle (teacher)
-"pi_temperature": 1.3,                             # policy temperature
+"reward_agg": null,                                # set to sum for hybrid rewards
+"reward_gamma": 0.92,                              # controls the inverse-cumulative weight for hybrid reward
+"grpo_level": "process",                           # process / outcome / hybrid
+
+# Lagrangian related
 "lambda_lr": 0.5,                                  # learning rate for lambda controller (identical for all)
 "lambda_init": 10.0,                               # lambda-controller initialization
+
+# Others
+"horizon": 4,                                      # look-ahead for greedy oracle (teacher)
+"pi_temperature": 1.3,                             # policy temperature
+
 ```
 
 Multi-GPU is not yet supported. All our tests are run on a single Nvidia A6000 GPU.

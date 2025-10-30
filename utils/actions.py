@@ -35,16 +35,15 @@ def _parse_quant_choices(choices: Sequence[str]) -> List[int]:
     """
     out = []
     for c in choices:
-        c = c.strip().lower()
-        if c == "q4":
-            out.append(4)
-        elif c == "q8":
-            out.append(8)
-        elif c == "q16":
-            out.append(16)
-        else:
-            raise ValueError(f"Unknown quant choice '{c}' (expected q4/q8/q16).")
+        s = c.strip().lower()
+        if not (s.startswith("q") and s[1:].isdigit()):
+            raise ValueError(f"Unknown quant choice '{c}' (expected q{N}).")
+        bits = int(s[1:])
+        if not (2 <= bits <= 16):
+            raise ValueError(f"bits must be in [2,16], got {bits}.")
+        out.append(bits)
     return out
+
 
 
 def build_action_spec(
