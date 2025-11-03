@@ -283,3 +283,205 @@ class PolicyHarnessLM(LM):
             self._record_request_stats(req, s)
             gens.append(self.tok.decode(gen_ids, skip_special_tokens=True))
         return gens
+
+
+
+
+# ---- NEW: LM-Eval wrapper for deterministic fixed baseline ----
+from policy_runtime import FixedLMRunner
+
+class FixedHarnessLM(LM):
+    """
+    LM-Eval-compatible wrapper that uses FixedLMRunner (no policy) to score/generate
+    with deterministic matched κ/ρ/bits.
+    """
+    SUPPORTED_TASKS = None
+    REQ_CHUNK_SIZE = 1
+
+    def __init__(
+        self,
+        ckpt_dir: str,
+        mode: str = "latest",
+        target_keep_effective: Optional[float] = None,
+        target_prune_keep: float = 1.0,
+        target_quant_ratio: float = 1.0,
+        struct_on_non_eff: bool = False,
+        episode_len: Optional[int] = None,
+        dense_refresh_tail: Optional[int] = None,
+        max_batch: int = 4,
+    ):
+        super().__init__()
+        self.ckpt_dir = ckpt_dir
+        self.ckpt_path = find_latest_ckpt(ckpt_dir, mode)
+        # Unlike PolicyHarnessLM, allow running without a policy checkpoint present.
+        self.cfg = load_cfg_from_checkpoint_or_yaml(ckpt_dir, self.ckpt_path)
+        self.tok, self.model = load_lm_and_tokenizer(self.cfg)
+
+        # sensible default for κ if not provided: use cfg.C_target or keep_target, else 1.0
+        if target_keep_effective is None:
+            target_keep_effective = float(getattr(self.cfg, "C_target",
+                                         getattr(self.cfg, "keep_target", 1.0)))
+
+        self.runner = FixedLMRunner(
+            cfg=self.cfg,
+            model=self.model,
+            tokenizer=self.tok,
+            target_keep_effective=float(target_keep_effective),
+            target_prune_keep=float(target_prune_keep),
+            target_quant_ratio=float(target_quant_ratio),
+            struct_on_non_eff=bool(struct_on_non_eff),
+            episode_len=episode_len if episode_len is not None else int(getattr(self.cfg, "rollout_len", 16)),
+            dense_refresh_tail=dense_refresh_tail if dense_refresh_tail is not None else int(getattr(self.cfg, "Ts",0) + getattr(self.cfg, "Tw",0) + 1),
+        )
+
+        self._max_batch = max_batch
+        self.vocab_size = unwrap(self.model).get_output_embeddings().weight.size(0)
+        self._eos = self.tok.eos_token_id
+
+        self.per_request_stats = []
+        self._agg = {
+            "policy_steps": 0,
+            "effective_steps": 0,
+            "keep_sum_all": 0.0,
+            "keep_sum_eff": 0.0,
+            "prune_sum_all": 0.0,
+            "prune_sum_eff": 0.0,
+            "qratio_sum_all": 0.0,
+            "qratio_sum_eff": 0.0,
+            "action_hist": [0] * int(self.runner.spec.n_actions),
+        }
+
+    def _record_request_stats(self, req, stats: dict):
+        task = getattr(req, "task_name", "unknown")
+        index = getattr(req, "index", None)
+        doc = getattr(req, "doc", None)
+        doc_id = None
+        if isinstance(doc, dict):
+            for k in ("id", "doc_id", "sample_id", "query_id"):
+                if k in doc: doc_id = doc[k]; break
+        entry = {
+            "task": task,
+            "index": index,
+            "doc_id": doc_id,
+            "keep_fracs": list(self.runner.spec.token_keep),
+            "action_tags": list(self.runner.spec.tags),
+            **stats,
+        }
+        self.per_request_stats.append(entry)
+        self._agg["policy_steps"] += stats.get("policy_steps", 0)
+        self._agg["effective_steps"] += stats.get("effective_steps", 0)
+        self._agg["keep_sum_all"] += stats.get("keep_sum_all", 0.0)
+        self._agg["keep_sum_eff"] += stats.get("keep_sum_eff", 0.0)
+        self._agg["prune_sum_all"] += stats.get("prune_sum_all", 0.0)
+        self._agg["prune_sum_eff"] += stats.get("prune_sum_eff", 0.0)
+        self._agg["qratio_sum_all"] += stats.get("qratio_sum_all", 0.0)
+        self._agg["qratio_sum_eff"] += stats.get("qratio_sum_eff", 0.0)
+        ah = stats.get("action_hist", [])
+        for i, c in enumerate(ah):
+            self._agg["action_hist"][i] += int(c)
+
+    def export_sparsity_stats(self):
+        g = self._agg
+        total_actions = max(1, sum(g["action_hist"]))
+        return {
+            "global": {
+                "keep_fracs": list(self.runner.spec.token_keep),
+                "action_tags": list(self.runner.spec.tags),
+                "policy_steps": g["policy_steps"],
+                "effective_steps": g["effective_steps"],
+                "keep_avg_all": (g["keep_sum_all"] / max(1, g["policy_steps"])),
+                "keep_avg_eff": (g["keep_sum_eff"] / max(1, g["effective_steps"])),
+                "prune_avg_all": (g["prune_sum_all"] / max(1, g["policy_steps"])),
+                "prune_avg_eff": (g["prune_sum_eff"] / max(1, g["effective_steps"])),
+                "quant_ratio_avg_all": (g["qratio_sum_all"] / max(1, g["policy_steps"])),
+                "quant_ratio_avg_eff": (g["qratio_sum_eff"] / max(1, g["effective_steps"])),
+                "avg_prune_keep": (g["prune_sum_eff"] / max(1, g["effective_steps"])),
+                "avg_quant_ratio": (g["qratio_sum_eff"] / max(1, g["effective_steps"])),
+                "action_hist": g["action_hist"],
+                "action_probs": [c / total_actions for c in g["action_hist"]],
+            },
+            "per_request": self.per_request_stats,
+        }
+
+    def max_length(self):
+        return int(getattr(unwrap(self.model).config, "max_position_embeddings", 4096))
+
+    def max_gen_toks(self):
+        return 256
+
+    def batch_size(self):
+        return self._max_batch
+
+    @property
+    def eot_token_id(self):
+        return self._eos
+
+    def tok_encode(self, s):
+        return self.tok.encode(s, add_special_tokens=False)
+
+    def tok_decode(self, ids):
+        return self.tok.decode(ids, skip_special_tokens=True)
+
+    def loglikelihood(self, requests):
+        out = []
+        for req in tqdm(requests, desc="loglikelihood", total=len(requests)):
+            ctx, cont = req.args
+            ctx_ids  = self.tok.encode(ctx, add_special_tokens=False)
+            cont_ids = self.tok.encode(cont, add_special_tokens=False)
+            max_ctx = self.max_length() - max(2, len(cont_ids)) - 4
+            if len(ctx_ids) > max_ctx:
+                ctx_ids = ctx_ids[-max_ctx:]
+
+            sum_lp, is_greedy, s = self.runner.score_continuation_fixed(ctx_ids, cont_ids)
+            self._record_request_stats(req, s)
+            out.append((sum_lp, is_greedy))
+        return out
+
+    def loglikelihood_rolling(self, requests):
+        out = []
+        for req in tqdm(requests, desc="loglikelihood_rolling", total=len(requests)):
+            (text,) = req.args if isinstance(req.args, (list, tuple)) else (req.args,)
+            ids = self.tok.encode(text, add_special_tokens=False)
+            if len(ids) <= 1:
+                out.append(0.0)
+                continue
+            split = min(64, max(1, len(ids)//20))
+            ctx_ids, cont_ids = ids[:split], ids[split:]
+            max_ctx = self.max_length() - max(2, len(cont_ids)) - 4
+            if len(ctx_ids) > max_ctx:
+                ctx_ids = ctx_ids[-max_ctx:]
+            sum_lp, _ = self.runner.score_continuation_fixed(ctx_ids, cont_ids)
+            out.append(sum_lp)
+        return out
+
+    def generate_until(self, requests):
+        gens = []
+        for req in tqdm(requests, desc="generate_until", total=len(requests)):
+            args = req.args if isinstance(req.args, (list, tuple)) else (req.args,)
+            if len(args) == 2 and isinstance(args[1], dict):
+                ctx, gen_kwargs = args
+            else:
+                ctx, until_list = args
+                gen_kwargs = {"until": until_list}
+            until = gen_kwargs.get("until", None)
+            max_new = int(gen_kwargs.get("max_gen_toks", self.max_gen_toks()))
+            temperature = float(gen_kwargs.get("temperature", 0.0))
+            top_p = gen_kwargs.get("top_p", None)
+            top_k = gen_kwargs.get("top_k", None)
+
+            ctx_ids = self.tok.encode(ctx, add_special_tokens=False)
+            max_ctx = self.max_length() - 128
+            if len(ctx_ids) > max_ctx:
+                ctx_ids = ctx_ids[-max_ctx:]
+            gen_ids, s = self.runner.generate_fixed(
+                ctx_ids=ctx_ids,
+                max_new_tokens=max_new,
+                until=until,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                return_stats=True,
+            )
+            self._record_request_stats(req, s)
+            gens.append(self.tok.decode(gen_ids, skip_special_tokens=True))
+        return gens

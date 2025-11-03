@@ -45,6 +45,15 @@ series_specs = {
     "EMC": ("emc_keep_all", "emc_ppl"),
 }
 
+name_map = {
+    "Fixed": "Fixed",
+    "Policy": "Policy",
+    "Greedy Oracle": "Greedy Oracle",
+    "Random": "Random",
+    "DAC": r"$\Delta_{\cos}(A)$",
+    "EMC": r"$\hat H$",
+}
+
 colors = ["tab:red", "tab:blue", "tab:green", "tab:orange", "tab:purple", "tab:brown"]
 for label, (xcol, ycol) in series_specs.items():
     if xcol in df.columns and ycol in df.columns:
@@ -56,7 +65,7 @@ for label, (xcol, ycol) in series_specs.items():
             .sort_values(xcol)
         )
         if not d.empty:
-            ax_right.plot(d[xcol], d[ycol], marker="o", linewidth=2, label=label, markersize=6,
+            ax_right.plot(d[xcol], d[ycol], marker="o", linewidth=2, label=name_map[label], markersize=6,
                           color=colors.pop(0))
 
 if "dense_ppl" in df.columns:

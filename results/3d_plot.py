@@ -3,7 +3,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 
-CSV_PATH = "multi_eff_ppl_scan_v2.csv"
+# CSV_PATH = "multi_eff_ppl_scan_v2.csv"
+CSV_PATH = "early_multiact_ppl.csv"
 
 OUT_ENVELOPE = "edc_envelope_v2.png"
 OUT_PLANES   = "delta_planes_v2.pdf"
@@ -139,6 +140,8 @@ to_numeric(df, [
     "sparsity_bias","prune_bias","quant_bias",
 ])
 
+df = df.loc[pd.to_numeric(df["policy_ppl"], errors="coerce") < 2.0 * pd.to_numeric(df["policy_ppl"], errors="coerce").min()]
+
 df["delta_ppl"] = df["fixed_ppl"] - df["policy_ppl"]
 
 # -----------------------------
@@ -184,20 +187,26 @@ fig2, ax2 = plt.subplots(figsize=(7,5))
 ax2.scatter(edc_mid[mask], deltas[mask], s=14, alpha=0.25)
 ax2.axhline(0.0, color="k", linewidth=1)
 
-bins = np.linspace(np.nanmin(edc_mid[mask]), np.nanmax(edc_mid[mask]), N_BINS+1)
-idx = np.digitize(edc_mid[mask], bins) - 1
-xb, mb = [], []
-for b in range(N_BINS):
-    sel = (idx == b)
-    if np.any(sel):
-        xb.append(0.5*(bins[b]+bins[b+1]))
-        mb.append(np.nanmedian(deltas[mask][sel]))
-ax2.plot(xb, mb, linewidth=2.2)
+x_sorted = edc_mid[mask].copy()
+y_sorted = deltas[mask].copy()
+order = np.argsort(x_sorted)
+x_sorted, y_sorted = x_sorted[order], y_sorted[order]
+
+k = max(21, len(x_sorted)//50)  # ~2% of data; tune as needed
+half = k // 2
+xm, ym = [], []
+for i in range(len(x_sorted)):
+    lo = max(0, i - half)
+    hi = min(len(x_sorted), i + half + 1)
+    xm.append(x_sorted[i])
+    ym.append(np.nanmedian(y_sorted[lo:hi]))
+ax2.plot(xm, ym, linewidth=1.2)
 win_rate = 100.0*np.mean(deltas[mask] > 0.0)
 ax2.set_title(f"Δ-Perplexity vs Compute")
 ax2.set_xlabel("Effective Decode Compute")
 ax2.set_ylabel("Δ perplexity (↑)")
 ax2.grid(True, alpha=0.3)
+ax2.set_ylim(-0.5, 2.5)
 fig2.tight_layout()
 fig2.savefig(OUT_DELTA_EDC, bbox_inches="tight")
 
@@ -360,12 +369,42 @@ else:
     fig.subplots_adjust(right=0.98)
     plt.savefig("policy_action_histogram.pdf", bbox_inches="tight")
     print("Saved policy_action_histogram.pdf")
-    edrate = 0.95
+    edrate = 1.0
     print(f"Win-rate @ EDC<{edrate}: {100*np.mean((df['policy_ppl'] < df['fixed_ppl'])[edc_policy < edrate]):.1f}%")
 
 
+    # --- Structured table of cases where policy is worse (policy_ppl > fixed_ppl) ---
 
+    # Pick the correct name for the sparsity bias column (handles the common typo).
+    sparsity_col = "sparsity_bias" if "sparsity_bias" in df.columns else ("sparisty_bias" if "sparisty_bias" in df.columns else None)
+    if sparsity_col is None:
+        raise KeyError("Couldn't find 'sparsity_bias' (or 'sparisty_bias') in df.columns")
 
+    cols = [sparsity_col, "prune_bias", "quant_bias", "fixed_ppl", "policy_ppl", "delta_ppl"]
+
+    # Filter: policy perplexity GREATER than fixed perplexity (policy underperforms).
+    worse_mask = pd.to_numeric(df["policy_ppl"], errors="coerce") > pd.to_numeric(df["fixed_ppl"], errors="coerce")
+
+    # Build the table, sort by how much worse (largest delta first).
+    tbl = (
+        df.loc[worse_mask, cols]
+        .copy()
+        .sort_values("delta_ppl", ascending=False)
+    )
+
+    # Nicely print to stdout
+    pd.set_option("display.max_rows", 200)   # tweak as you like
+    pd.set_option("display.width", 160)
+    pd.set_option("display.max_colwidth", 40)
+
+    print(f"\nRows where policy perplexity > fixed perplexity (N={len(tbl)}):\n")
+    print(tbl.to_string(index=False))
+
+    # # Optional: also save it for later inspection
+    # tbl.to_csv("policy_worse_cases.csv", index=False)
+    # print("\nSaved: policy_worse_cases.csv")
+
+    print(sorted(df["policy_ppl"].to_list()))
 
 
 

@@ -15,6 +15,7 @@ torchrun --nproc_per_node=1 --master_port 29510 train.py   \
   --wandb_project SOL     --wandb_run_name RL_LCE_Quest4    \
    --config /home/ya255/SOL/official_configs/RL_LCE_Quest4.yml
 
+
 torchrun --nproc_per_node=1 --master_port 29511 train.py   \
   --wandb_project SOL     --wandb_run_name RL_LCE_Quest8_PruneQuant    \
    --config /home/ya255/SOL/official_configs/RL_LCE_Quest8_PruneQuant.yml
@@ -40,5 +41,14 @@ torchrun --nproc_per_node=1 --master_port 29516 train.py   \
    --config /home/ya255/SOL/official_configs/RL_LCE_Prune.yml
 
 torchrun --nproc_per_node=1 --master_port 29517 train.py   \
+  --wandb_project SOL     --wandb_run_name RL_LCE_Quant4    \
+   --config /home/ya255/SOL/official_configs/RL_LCE_Quant4.yml
+   
+torchrun --nproc_per_node=1 --master_port 29518 train.py   \
+  --wandb_project SOL     --wandb_run_name RL_LCE_Quant5    \
+   --config /home/ya255/SOL/official_configs/RL_LCE_Quant5.yml
+
+   
+torchrun --nproc_per_node=1 --master_port 29533 train.py   \
   --wandb_project SOL     --wandb_run_name RL_LCE_Quant    \
    --config /home/ya255/SOL/official_configs/RL_LCE_Quant.yml

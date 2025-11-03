@@ -608,10 +608,8 @@ def enable_structured_controls(model, *, apply_to_attention_input: bool = True) 
             k_counts = (keep * D).ceil().clamp_(1, D).to(torch.int64)  # [B]
             # score per channel = max |activation| across tokens in this call
             scores = hidden_states.abs().amax(dim=1)  # [B, D]
-            max_k = int(k_counts.max().item())
-            if max_k >= D:
-                return hidden_states
-            topk_vals, _ = torch.topk(scores, k=max_k, dim=-1)  # [B, max_k]
+            max_k = int(k_counts.max().clamp(1, D).item())
+            topk_vals, _ = torch.topk(scores, k=max_k, dim=-1)
             row = torch.arange(B, device=hidden_states.device)
             thr = topk_vals[row, (k_counts - 1).clamp_min(0)]    # [B]
             mask = (scores >= thr.unsqueeze(-1)).to(hidden_states.dtype).unsqueeze(1)  # [B,1,D]

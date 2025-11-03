@@ -17,14 +17,9 @@ class ActionSpec:
 
 
 def _parse_prune_choices(choices: Sequence[str]) -> List[float]:
-    """
-    Map strings to keep-fractions:
-      s40 -> keep 0.60; s70 -> keep 0.30; s100 -> keep 1.0
-    """
     out = []
     for c in choices:
         c = c.strip().lower()
-        # out.append(1 - float(c.split("s")[-1])/100.0)
         out.append(float(c.split("s")[-1])/100.0)
     return out
 
