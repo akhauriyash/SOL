@@ -2,7 +2,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 
-df = pd.read_csv("lce_more_baselines.csv")
+df = pd.read_csv("sparse_bias.csv")
 
 num_cols = [
     "sparsity_bias",

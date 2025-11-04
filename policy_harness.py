@@ -423,18 +423,43 @@ class FixedHarnessLM(LM):
         return self.tok.decode(ids, skip_special_tokens=True)
 
     def loglikelihood(self, requests):
+        """
+        Micro-batch the fixed scorer so we can mix κ/ρ/q *across* a batch per step.
+        This lets short continuations (1–3 tokens) still meet the target on average
+        across the batch, not just over time within one sample.
+        """
         out = []
-        for req in tqdm(requests, desc="loglikelihood", total=len(requests)):
-            ctx, cont = req.args
-            ctx_ids  = self.tok.encode(ctx, add_special_tokens=False)
-            cont_ids = self.tok.encode(cont, add_special_tokens=False)
-            max_ctx = self.max_length() - max(2, len(cont_ids)) - 4
-            if len(ctx_ids) > max_ctx:
-                ctx_ids = ctx_ids[-max_ctx:]
+        N = len(requests)
+        i = 0
+        pbar = tqdm(total=N, desc="loglikelihood (fixed,microbatch)")
+        while i < N:
+            B = min(self._max_batch, N - i)
+            chunk = requests[i : i + B]
 
-            sum_lp, is_greedy, s = self.runner.score_continuation_fixed(ctx_ids, cont_ids)
-            self._record_request_stats(req, s)
-            out.append((sum_lp, is_greedy))
+            ctx_list = []
+            cont_list = []
+            for req in chunk:
+                ctx, cont = req.args
+                ctx_ids  = self.tok.encode(ctx, add_special_tokens=False)
+                cont_ids = self.tok.encode(cont, add_special_tokens=False)
+                max_ctx = self.max_length() - max(2, len(cont_ids)) - 4
+                if len(ctx_ids) > max_ctx:
+                    ctx_ids = ctx_ids[-max_ctx:]
+                ctx_list.append(ctx_ids)
+                cont_list.append(cont_ids)
+
+            # NEW: batch-mixed fixed scorer (per-step mixing across the B requests)
+            lp_list, greedy_list, stats_list = self.runner.score_continuation_fixed_batch(
+                ctx_list, cont_list
+            )
+
+            for j, req in enumerate(chunk):
+                self._record_request_stats(req, stats_list[j])
+                out.append((lp_list[j], greedy_list[j]))
+
+            i += B
+            pbar.update(B)
+        pbar.close()
         return out
 
     def loglikelihood_rolling(self, requests):

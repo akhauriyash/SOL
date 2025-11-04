@@ -17,7 +17,7 @@ import os
 import numpy as np
 
 from policy_runtime import PolicyLMRunner
-from policy_harness import PolicyHarnessLM
+from policy_harness import PolicyHarnessLM, FixedHarnessLM
 
 def _select_accuracy_metric(metrics: dict) -> Optional[float]:
     """
@@ -75,16 +75,20 @@ def _extract_sparsity_means(stats: dict) -> dict:
         "quant_ratio_avg": qratio,
         "avg_bits": 16.0 * qratio,
     }
-
-def _write_key_metrics(sidecar_path: str, stats_policy: dict, res_policy: dict,
-                       stats_dense: Optional[dict] = None, res_dense: Optional[dict] = None):
+    
+def _write_key_metrics(sidecar_path: str,
+                       stats_policy: Optional[dict] = None, res_policy: Optional[dict] = None,
+                       stats_dense: Optional[dict] = None,  res_dense: Optional[dict] = None,
+                       stats_fixed: Optional[dict] = None,  res_fixed: Optional[dict] = None):
     out_dir, base = dirname(sidecar_path), basename(sidecar_path)
     key_path = join(out_dir, "key_metrics_" + base)
-    payload = {
-        "policy": {**_extract_sparsity_means(stats_policy), "accuracy": _extract_accuracy(res_policy)}
-    }
+    payload = {}
+    if stats_policy is not None and res_policy is not None:
+        payload["policy"] = {**_extract_sparsity_means(stats_policy), "accuracy": _extract_accuracy(res_policy)}
     if stats_dense is not None and res_dense is not None:
         payload["dense_baseline"] = {**_extract_sparsity_means(stats_dense), "accuracy": _extract_accuracy(res_dense)}
+    if stats_fixed is not None and res_fixed is not None:
+        payload["fixed_baseline"] = {**_extract_sparsity_means(stats_fixed), "accuracy": _extract_accuracy(res_fixed)}
     with open(key_path, "w") as f:
         json.dump(payload, f, indent=2, default=_json_default)
     print(f"[saved] key metrics → {key_path}")
@@ -143,6 +147,55 @@ def print_compact_summary(res):
     else:
         print("No accuracy-like metric found in results.")
 
+
+_BIAS_KINDS = ("quant", "sparsity", "prune")
+_KIND_TO_METRIC = {
+    "quant": "quant_ratio_avg",
+    "sparsity": "token_keep_avg",
+    "prune": "prune_keep_avg",
+}
+
+def _parse_bias_from_filename(path: str) -> Tuple[str, float]:
+    """
+    Extract (kind, value) from filenames like '..._quant_-4.json' or '..._sparsity_1.5.json'.
+    """
+    name = basename(path)
+    m = re.search(r'_(quant|sparsity|prune)_([+-]?\d+(?:\.\d+)?)', name)
+    if not m:
+        raise ValueError(f"Could not parse bias kind/value from filename: {name}")
+    kind = m.group(1)
+    val = float(m.group(2))
+    return kind, val
+
+def _resolve_key_metrics_path(ref_path: str) -> str:
+    """
+    Accept either a key-metrics file itself or the base eval file and return the key-metrics path.
+    """
+    d, b = dirname(ref_path), basename(ref_path)
+    if b.startswith("key_metrics_"):
+        return ref_path
+    candidate = join(d, "key_metrics_" + b)
+    return candidate if os.path.exists(candidate) else ref_path
+
+def _load_reference_metrics(path: str) -> dict:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Reference key-metrics file not found: {path}")
+    with open(path, "r") as f:
+        return json.load(f)
+
+def _pick_metric_from_reference(ref_payload: dict, metric_name: str) -> Optional[float]:
+    """
+    Try common blocks in priority order: policy → fixed_baseline → dense_baseline.
+    """
+    for block in ("policy", "fixed_baseline", "dense_baseline"):
+        if block in ref_payload and isinstance(ref_payload[block], dict):
+            blk = ref_payload[block]
+            if metric_name in blk:
+                return float(blk[metric_name])
+    # Flat payload fallback (unlikely)
+    return float(ref_payload.get(metric_name)) if metric_name in ref_payload else None
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt_dir", type=str, required=True, help="Directory with policy_*.pt")
@@ -160,8 +213,85 @@ def main():
     p.add_argument("--sparsity_bias", type=float, default=0.0, help=">0 favors sparser keep_fracs; <0 favors denser")
     p.add_argument("--prune_bias", type=float, default=0.0, help=">0 favors more structural pruning (lower keep after pruning)")
     p.add_argument("--quant_bias", type=float, default=0.0, help=">0 favors lower-bit quantization")
+    p.add_argument("--fixed_baseline_reference", type=str, default=None,
+                   help="Path to (or sibling of) a key_metrics_*.json file from a previous run. "
+                        "Will parse bias kind/value from the filename and use the matching "
+                        "metric (quant_ratio_avg/token_keep_avg/prune_keep_avg) as the fixed target. "
+                        "Skips policy and dense runs.")
+    p.add_argument("--fixed_from_policy", action="store_true",
+                   help="After running the policy, run a FixedHarnessLM that targets the policy's observed averages (token_keep/prune_keep/quant_ratio).")
     args = p.parse_args()
 
+    # If a reference for fixed baseline is provided, run fixed-only path and exit.
+    if args.fixed_baseline_reference:
+        # Validate exactly one non-zero bias is provided
+        bias_map = {
+            "quant": float(args.quant_bias),
+            "sparsity": float(args.sparsity_bias),
+            "prune": float(args.prune_bias),
+        }
+        nonzero = [(k, v) for k, v in bias_map.items() if abs(v) > 1e-12]
+        if len(nonzero) != 1:
+            raise ValueError("Exactly one of --quant_bias/--sparsity_bias/--prune_bias must be non-zero "
+                             "when using --fixed_baseline_reference.")
+        (bias_kind_cli, bias_val_cli) = nonzero[0]
+
+        ref_path = _resolve_key_metrics_path(args.fixed_baseline_reference)
+        bias_kind_file, bias_val_file = _parse_bias_from_filename(ref_path)
+        if bias_kind_file != bias_kind_cli:
+            raise AssertionError(f"Bias kind mismatch: CLI={bias_kind_cli} vs file={bias_kind_file} ({basename(ref_path)})")
+        # Allow integer vs float nuances (e.g., -4 vs -4.0)
+        if not math.isclose(bias_val_file, bias_val_cli, rel_tol=0, abs_tol=1e-6):
+            raise AssertionError(f"Bias value mismatch: CLI={bias_val_cli} vs file={bias_val_file} ({basename(ref_path)})")
+
+        ref_payload = _load_reference_metrics(ref_path)
+
+        # --- NEW: read ALL axes from reference so fixed mirrors policy’s observed budgets ---
+        tk = _pick_metric_from_reference(ref_payload, "token_keep_avg")
+        pr = _pick_metric_from_reference(ref_payload, "prune_keep_avg")
+        qr = _pick_metric_from_reference(ref_payload, "quant_ratio_avg")
+        if tk is None and pr is None and qr is None:
+            raise KeyError(f"No usable targets found in {ref_path}")
+
+        # Fallbacks: keep defaults from FixedHarnessLM if any are missing
+        # (tk -> cfg.C_target/keep_target inside harness; pr/qr default to 1.0 there)
+        tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
+        fixed_kwargs_all = {
+            "ckpt_dir": args.ckpt_dir,
+            "mode": args.mode,
+            "episode_len": args.episode_len,
+            "dense_refresh_tail": args.dense_refresh_tail,
+            "max_batch": args.batch_size,
+        }
+        if tk is not None:
+            fixed_kwargs_all["target_keep_effective"] = float(tk)
+        if pr is not None:
+            fixed_kwargs_all["target_prune_keep"] = float(pr)
+        if qr is not None:
+            fixed_kwargs_all["target_quant_ratio"] = float(qr)
+
+        fixed_model = FixedHarnessLM(**fixed_kwargs_all)
+        res_fixed = evaluator.simple_evaluate(
+            model=fixed_model, tasks=tasks, batch_size=args.batch_size, limit=args.limit, num_fewshot=0
+        )
+        fixed_stats = fixed_model.export_sparsity_stats()
+        print("\n=== Observed sparsity (fixed from reference) ===")
+        print(json.dumps(fixed_stats["global"], indent=2, default=_json_default))
+
+        if args.export_sparsity_json:
+            with open(args.export_sparsity_json, "w") as f:
+                json.dump(fixed_stats, f, indent=2, default=_json_default)
+            print(f"[saved] per-request sparsity (fixed) → {args.export_sparsity_json}")
+            _write_key_metrics(
+                sidecar_path=args.export_sparsity_json,
+                stats_fixed=fixed_stats, res_fixed=res_fixed,
+            )
+
+        print("\n\n## Fixed baseline (from reference)")
+        print_compact_summary(res_fixed)
+        return
+
+    # --- default flow (policy, optional dense) ---
     model = PolicyHarnessLM(
         ckpt_dir=args.ckpt_dir,
         mode=args.mode,
@@ -187,19 +317,61 @@ def main():
     stats_all = model.export_sparsity_stats()
     print("\n=== Observed sparsity (policy run) ===")
     print(json.dumps(stats_all["global"], indent=2))
+
     if args.export_sparsity_json:
         with open(args.export_sparsity_json, "w") as f:
             json.dump(stats_all, f, indent=2, default=_json_default)
         print(f"[saved] per-request sparsity → {args.export_sparsity_json}")
 
-        # Write compact sidecar with just key metrics for easy plotting.
+    # --- NEW: optionally mirror policy budgets with FixedHarnessLM (no reference file) ---
+    res_fixed = None
+    fixed_stats = None
+    if args.fixed_from_policy:
+        means = _extract_sparsity_means(stats_all)
+        fixed_kwargs_all = {
+            "ckpt_dir": args.ckpt_dir,
+            "mode": args.mode,
+            "episode_len": args.episode_len,
+            "dense_refresh_tail": args.dense_refresh_tail,
+            "max_batch": args.batch_size,
+        }
+        # Map our means into FixedHarnessLM targets.
+        if "token_keep_avg" in means and means["token_keep_avg"] is not None:
+            fixed_kwargs_all["target_keep_effective"] = float(means["token_keep_avg"])
+        if "prune_keep_avg" in means and means["prune_keep_avg"] is not None:
+            fixed_kwargs_all["target_prune_keep"] = float(means["prune_keep_avg"])
+        if "quant_ratio_avg" in means and means["quant_ratio_avg"] is not None:
+            fixed_kwargs_all["target_quant_ratio"] = float(means["quant_ratio_avg"])
+
+        fixed_model = FixedHarnessLM(**fixed_kwargs_all)
+        res_fixed = evaluator.simple_evaluate(
+            model=fixed_model, tasks=tasks, batch_size=args.batch_size, limit=args.limit, num_fewshot=0
+        )
+        fixed_stats = fixed_model.export_sparsity_stats()
+        print("\n=== Observed sparsity (fixed-from-policy) ===")
+        print(json.dumps(fixed_stats["global"], indent=2, default=_json_default))
+
+        if args.export_sparsity_json:
+            root, ext = os.path.splitext(args.export_sparsity_json)
+            fixed_path = root + "_fixed" + ext
+            with open(fixed_path, "w") as f:
+                json.dump(fixed_stats, f, indent=2, default=_json_default)
+            print(f"[saved] per-request sparsity (fixed) → {fixed_path}")
+
+    # If we saved JSON, (re)write compact key-metrics including fixed if present.
+    if args.export_sparsity_json:
         _write_key_metrics(
             sidecar_path=args.export_sparsity_json,
-            stats_policy=stats_all,
-            res_policy=res_policy,
+            stats_policy=stats_all, res_policy=res_policy,
+            stats_fixed=fixed_stats,  res_fixed=res_fixed,
         )
+
     if not args.dense_baseline:
-        print(json.dumps(res_policy, indent=2, default=_json_default))
+        if res_fixed is None:
+            print(json.dumps(res_policy, indent=2, default=_json_default))
+        else:
+            print(json.dumps({"policy_sparse": res_policy, "fixed_from_policy": res_fixed},
+                             indent=2, default=_json_default))
         return
 
     print_compact_summary(res_policy)

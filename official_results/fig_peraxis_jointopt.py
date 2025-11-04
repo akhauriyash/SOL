@@ -5,8 +5,8 @@ import matplotlib.pyplot as plt
 import sys
 
 # ---------- Config ----------
-CSV_PATH = "early_multiact_ppl.csv"   # change if needed
-OUT_FIG  = "delta_vs_edc_by_bias.pdf"
+CSV_PATH = "multi_efficiency_plot.csv"   # change if needed
+OUT_FIG  = "peraxis_jointopt.pdf"
 
 # Effective decode compute weights (same logic as your script)
 W_ATTN   = 0.5

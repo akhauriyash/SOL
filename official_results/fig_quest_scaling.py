@@ -11,8 +11,8 @@ plt.rcParams.update({
 })
 
 
-path_tuples = [("lce_sparsity_questp16_bias_ckpt_perplexities.csv", "quest_scaling_p16.pdf"),
-               ("lce_sparsity_questp4_bias_ckpt_perplexities.csv", "quest_scaling_p4.pdf")]
+path_tuples = [("quest_scaling_p16.csv", "quest_scaling_p16.pdf"),
+               ("quest_scaling_p4.csv", "quest_scaling_p4.pdf")]
 
 for path, imgname in path_tuples:
     df_quest = pd.read_csv(path)

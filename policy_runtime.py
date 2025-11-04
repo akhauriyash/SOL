@@ -74,10 +74,21 @@ class FixedLMRunner:
         self.spec = spec
         enable_structured_controls(self.m)
 
-        # Axes (unique values)
-        self._keep_axis: List[float] = [float(x) for x in spec.token_keep_unique]
-        self._prune_axis: List[float] = [float(x) for x in spec.prune_keep_unique]
-        self._qbits_axis: List[int]   = [int(x)   for x in spec.q_bits_unique]
+        # Axes (unique values) — derive from flattened grid while preserving the
+        # original build_action_spec order (k outer, then p, then q).
+        def _uniq_in_order(seq):
+            out = []
+            seen = set()
+            for x in seq:
+                if x not in seen:
+                    seen.add(x)
+                    out.append(x)
+            return out
+
+        self._keep_axis = [float(x) for x in _uniq_in_order(self.spec.token_keep)]
+        self._prune_axis = [float(x) for x in _uniq_in_order(self.spec.prune_keep)]
+        self._qbits_axis = [int(x) for x in _uniq_in_order(self.spec.q_bits)]
+
         self.K, self.P, self.Q = len(self._keep_axis), len(self._prune_axis), len(self._qbits_axis)
         # Derived ratios for quantization (clamp min 1/16)
         self._qratio_axis: List[float] = [max(1.0, float(b)) / 16.0 for b in self._qbits_axis]
@@ -185,25 +196,19 @@ class FixedLMRunner:
         }
 
         steps_in_episode = 0
+        # Dense prefill on *context only*; all continuation tokens will use fixed κ/ρ/q
+        past_kv, kv_len, _state_lm = self._dense_prefill(torch.tensor(running, dtype=torch.long))
 
-        # Dense prefill on context; also consume the first continuation token densely (teacher forcing)
-        with torch.inference_mode():
-            past_kv, kv_len, _state_lm = self._dense_prefill(torch.tensor(running, dtype=torch.long))
-            if len(cont_ids) > 0:
-                ids = torch.tensor(running, dtype=torch.long, device=device).unsqueeze(0)
-                out = self.m(input_ids=ids, use_cache=False, return_dict=True)
-                logprobs_next = F.log_softmax(out.logits[:, -1, :], dim=-1)
-                total_lp += float(logprobs_next[0, cont_ids[0]].item())
-                running.append(cont_ids[0])
-
-        for i in range(1, len(cont_ids) + 1):
-            if steps_in_episode == 0:
+        for i in range(0, len(cont_ids)):
+            # episodic re-densify using the configured tail (skip on very first step since we just prefetched)
+            if steps_in_episode == 0 and i > 0:
                 max_ctx = int(getattr(unwrap(self.m).config, "max_position_embeddings", 4096)) - 1
-                pref_ids = torch.tensor(running[-max_ctx:], dtype=torch.long)
+                pref_window = min(self.dense_refresh_tail, max_ctx, len(running))
+                pref_ids = torch.tensor(running[-pref_window:], dtype=torch.long)
                 past_kv, kv_len, _ = self._dense_prefill(pref_ids)
             cur_tok = running[-1]
             cur = torch.tensor([cur_tok], device=device, dtype=torch.long)
-            labels_next = cont_ids[i] if i < len(cont_ids) else None
+            labels_next = cont_ids[i]
 
             eff_mask = (kv_len > self.thr).item()
 
@@ -271,18 +276,17 @@ class FixedLMRunner:
                 self._cum_prune_sum += float(prune_now.item())
                 self._cum_qratio_sum += float(qratio_now.item())
 
-            if labels_next is not None:
-                logp = F.log_softmax(logits_step, dim=-1)[0, labels_next]
-                total_lp += float(logp.item())
-                greedy_tok = int(torch.argmax(logits_step, dim=-1)[0].item())
-                if greedy_tok != labels_next:
-                    is_greedy_all = False
-                running.append(labels_next)
-
+            # score and append the current continuation token
+            logp = F.log_softmax(logits_step, dim=-1)[0, labels_next]
+            total_lp += float(logp.item())
+            greedy_tok = int(torch.argmax(logits_step, dim=-1)[0].item())
+            if greedy_tok != labels_next:
+                is_greedy_all = False
+            running.append(labels_next)
             steps_in_episode += 1
             if steps_in_episode >= self.episode_len:
                 steps_in_episode = 0
-
+        print(f"Length: {len(cont_ids)}")
         # Aggregate means (prefer effective)
         stats["keep_avg_all"] = (stats["keep_sum_all"] / max(1, stats["policy_steps"]))
         stats["keep_avg_eff"] = (stats["keep_sum_eff"] / max(1, stats["effective_steps"])) if stats["effective_steps"] > 0 else stats["keep_avg_all"]
@@ -295,6 +299,240 @@ class FixedLMRunner:
         stats["avg_prune_keep"] = stats["prune_avg_eff"]; stats["avg_quant_ratio"] = stats["quant_ratio_avg_eff"]
         return total_lp, is_greedy_all, stats
 
+    @torch.inference_mode()
+    def score_continuation_fixed_batch(
+        self,
+        batch_ctx_ids: List[List[int]],
+        batch_cont_ids: List[List[int]],
+    ) -> Tuple[List[float], List[bool], List[dict]]:
+        """
+        Per-step *batch* mixing for fixed κ/ρ/q targets.
+        At each continuation step t, among the "live" items we choose how many
+        take the hi/lo endpoint on each axis so that the step-average tracks
+        the target (residual-corrected), then execute each item.
+        This guarantees that very short continuations still meet budgets
+        on average *across the batch* (up to rounding from discrete endpoints).
+        """
+        device = self.device
+        B = len(batch_ctx_ids)
+        if B == 0:
+            return [], [], []
+
+        # Per-sample state
+        running = [list(ctx) for ctx in batch_ctx_ids]
+        past_kv: List = [None] * B
+        kv_len: List[torch.Tensor] = [None] * B
+        total_lp = [0.0 for _ in range(B)]
+        is_greedy_all = [True for _ in range(B)]
+        steps_in_episode = [0 for _ in range(B)]
+
+        def _init_stats():
+            return {
+                "policy_steps": 0,
+                "effective_steps": 0,
+                "keep_sum_all": 0.0,
+                "keep_sum_eff": 0.0,
+                "prune_sum_all": 0.0,
+                "prune_sum_eff": 0.0,
+                "qratio_sum_all": 0.0,
+                "qratio_sum_eff": 0.0,
+                "action_hist": [0] * int(self.spec.n_actions),
+                "episode_len": self.episode_len,
+                "dense_refresh_tail": self.dense_refresh_tail,
+                "dense_first_token": False,
+            }
+        stats = [_init_stats() for _ in range(B)]
+
+        # Residual trackers across *batch* over time (for exacting step averages)
+        cum_eff_steps = 0
+        cum_keep_sum = 0.0
+        cum_struct_steps = 0
+        cum_prune_sum = 0.0
+        cum_qratio_sum = 0.0
+
+        # Initial dense prefill on context only; all continuation tokens will be controlled
+        for i in range(B):
+            pref_ids = torch.tensor(running[i], dtype=torch.long)
+            past_kv[i], kv_len[i], _ = self._dense_prefill(pref_ids)
+            # ensure this flag reflects that the first token is *not* dense-scored
+            stats[i]["dense_first_token"] = False
+
+        def _clamp(v, a, b):
+            lo, hi = (a, b) if a <= b else (b, a)
+            return float(max(lo, min(hi, v)))
+
+        max_T = max((len(c) for c in batch_cont_ids), default=0)
+        for t in range(0, max_T):
+            # Which items still have a token to score at step t?
+            live = [i for i in range(B) if t < len(batch_cont_ids[i])]
+            if not live:
+                break
+
+            # Effective / structural masks for this step
+            eff_mask = [bool((kv_len[i] > self.thr).item()) for i in live]
+            if self.struct_on_non_eff:
+                struct_mask = [True] * len(live)
+            else:
+                struct_mask = eff_mask[:]
+
+            # ---- Choose κ across the effective subset (residual-corrected) ----
+            k_idx_sel = [self._dense_k] * len(live)  # defaults for non-effective tokens
+            S_eff = sum(1 for f in eff_mask if f)
+            if S_eff > 0:
+                req_keep = (self.t_keep * (cum_eff_steps + S_eff) - cum_keep_sum) / S_eff
+                req_keep = _clamp(req_keep, self.k_lo_v, self.k_hi_v)
+                if self.k_lo != self.k_hi and (self.k_hi_v != self.k_lo_v):
+                    share_hi = _clamp((req_keep - self.k_lo_v) / (self.k_hi_v - self.k_lo_v), 0.0, 1.0)
+                    n_hi = int(round(share_hi * S_eff))
+                    eff_pos = [j for j, f in enumerate(eff_mask) if f]
+                    start = (t * 131) % S_eff  # deterministic round-robin
+                    hi_pos = [eff_pos[(start + j) % S_eff] for j in range(n_hi)]
+                    for j in eff_pos:
+                        k_idx_sel[j] = self.k_lo
+                    for j in hi_pos:
+                        k_idx_sel[j] = self.k_hi
+                else:
+                    for j, f in enumerate(eff_mask):
+                        if f:
+                            k_idx_sel[j] = self.k_lo
+                # advance residuals
+                keep_sum_step = sum(self._keep_axis[k_idx_sel[j]] for j, f in enumerate(eff_mask) if f)
+                cum_keep_sum += float(keep_sum_step)
+                cum_eff_steps += S_eff
+
+            # ---- Choose ρ and q across the structural subset ----
+            p_idx_sel = [self._dense_p] * len(live)
+            q_idx_sel = [self._dense_q] * len(live)
+            S_struct = sum(1 for f in struct_mask if f)
+            if S_struct > 0:
+                # prune keep ρ
+                req_pr = (self.t_prune * (cum_struct_steps + S_struct) - cum_prune_sum) / S_struct
+                req_pr = _clamp(req_pr, self.p_lo_v, self.p_hi_v)
+                if self.p_lo != self.p_hi and (self.p_hi_v != self.p_lo_v):
+                    share_hi_p = _clamp((req_pr - self.p_lo_v) / (self.p_hi_v - self.p_lo_v), 0.0, 1.0)
+                    n_hi_p = int(round(share_hi_p * S_struct))
+                    struct_pos = [j for j, f in enumerate(struct_mask) if f]
+                    start_p = ((t + 17) * 97) % S_struct
+                    hi_p = [struct_pos[(start_p + j) % S_struct] for j in range(n_hi_p)]
+                    for j in struct_pos:
+                        p_idx_sel[j] = self.p_lo
+                    for j in hi_p:
+                        p_idx_sel[j] = self.p_hi
+                else:
+                    for j, f in enumerate(struct_mask):
+                        if f:
+                            p_idx_sel[j] = self.p_lo
+                # quant ratio
+                req_q = (self.t_qratio * (cum_struct_steps + S_struct) - cum_qratio_sum) / S_struct
+                q_min, q_max = min(self._qratio_axis), max(self._qratio_axis)
+                req_q = _clamp(req_q, q_min, q_max)
+                if self.q_lo != self.q_hi and (self.q_hi_v != self.q_lo_v):
+                    share_hi_q = _clamp((req_q - self.q_lo_v) / (self.q_hi_v - self.q_lo_v), 0.0, 1.0)
+                    n_hi_q = int(round(share_hi_q * S_struct))
+                    struct_pos = [j for j, f in enumerate(struct_mask) if f]
+                    start_q = ((t + 37) * 89) % S_struct
+                    hi_q = [struct_pos[(start_q + j) % S_struct] for j in range(n_hi_q)]
+                    for j in struct_pos:
+                        q_idx_sel[j] = self.q_lo
+                    for j in hi_q:
+                        q_idx_sel[j] = self.q_hi
+                else:
+                    for j, f in enumerate(struct_mask):
+                        if f:
+                            q_idx_sel[j] = self.q_lo
+                # advance residuals
+                prune_sum_step = sum(self._prune_axis[p_idx_sel[j]] for j, f in enumerate(struct_mask) if f)
+                qratio_sum_step = sum(max(1.0, float(self._qbits_axis[q_idx_sel[j]])) / 16.0
+                                      for j, f in enumerate(struct_mask) if f)
+                cum_prune_sum += float(prune_sum_step)
+                cum_qratio_sum += float(qratio_sum_step)
+                cum_struct_steps += S_struct
+
+            # ---- Execute each live item with its assigned endpoints ----
+            for pos, i in enumerate(live):
+                cur_tok = running[i][-1]
+                cur = torch.tensor([cur_tok], device=device, dtype=torch.long)
+                labels_next = batch_cont_ids[i][t]
+
+                eff = eff_mask[pos]
+                k_idx = k_idx_sel[pos] if eff else self._dense_k
+                p_idx = p_idx_sel[pos]
+                q_idx = q_idx_sel[pos]
+
+                kappa_now = torch.tensor([self._keep_axis[k_idx]], device=device, dtype=torch.float32)
+                prune_now = torch.tensor([self._prune_axis[p_idx]], device=device, dtype=torch.float32)
+                qbits_now = torch.tensor([self._qbits_axis[q_idx]], device=device, dtype=torch.int64)
+                qratio_now = qbits_now.to(torch.float32).clamp_(min=1.0) / 16.0
+
+                pos_ids = (kv_len[i] - 1).clamp_min(0).unsqueeze(1)
+                bias = build_sparse_attention_bias(
+                    model=self.m,
+                    past_kv_lens=kv_len[i],
+                    keep_fracs=kappa_now,
+                    Ts=self.Ts, Tw=self.Tw,
+                    device=device, dtype=self.dtype,
+                    criteria=self.criteria, tier=self.tier,
+                )
+                set_structured_action(self.m, float(prune_now.item()), int(qbits_now.item()))
+                out_step = self.m(
+                    input_ids=cur.view(1, 1),
+                    use_cache=True,
+                    past_key_values=past_kv[i],
+                    position_ids=pos_ids,
+                    attention_mask=bias,
+                    return_dict=True,
+                )
+                clear_structured_action(self.m)
+                logits_step = out_step.logits[:, -1, :]
+                past_kv[i] = out_step.past_key_values
+                kv_len[i] = kv_len[i] + 1
+
+                s = stats[i]
+                s["policy_steps"] += 1
+                s["keep_sum_all"] += float(kappa_now.item())
+                s["prune_sum_all"] += float(prune_now.item())
+                s["qratio_sum_all"] += float(qratio_now.item())
+                a_idx = self._kpq_to_action_idx(k_idx, p_idx, q_idx)
+                s["action_hist"][a_idx] += 1
+                if eff:
+                    s["effective_steps"] += 1
+                    s["keep_sum_eff"] += float(kappa_now.item())
+                if eff or self.struct_on_non_eff:
+                    s["prune_sum_eff"] += float(prune_now.item())
+                    s["qratio_sum_eff"] += float(qratio_now.item())
+
+                # score and append this step's continuation token
+                logp = F.log_softmax(logits_step, dim=-1)[0, labels_next]
+                total_lp[i] += float(logp.item())
+                greedy_tok = int(torch.argmax(logits_step, dim=-1)[0].item())
+                if greedy_tok != labels_next:
+                    is_greedy_all[i] = False
+                running[i].append(labels_next)
+
+                # episodic refresh per-sample (use dense_refresh_tail) before the *next* step
+                steps_in_episode[i] += 1
+                if steps_in_episode[i] >= self.episode_len:
+                    max_ctx = int(getattr(unwrap(self.m).config, "max_position_embeddings", 4096)) - 1
+                    pref_window = min(self.dense_refresh_tail, max_ctx, len(running[i]))
+                    pref_ids = torch.tensor(running[i][-pref_window:], dtype=torch.long)
+                    past_kv[i], kv_len[i], _ = self._dense_prefill(pref_ids)
+                    steps_in_episode[i] = 0
+
+        # finalize per-sample stats
+        for i in range(B):
+            s = stats[i]
+            s["keep_avg_all"] = s["keep_sum_all"] / max(1, s["policy_steps"])
+            s["keep_avg_eff"] = s["keep_sum_eff"] / max(1, s["effective_steps"]) if s["effective_steps"] > 0 else s["keep_avg_all"]
+            s["prune_avg_all"] = s["prune_sum_all"] / max(1, s["policy_steps"])
+            s["quant_ratio_avg_all"] = s["qratio_sum_all"] / max(1, s["policy_steps"])
+            denom_eff = s["effective_steps"] if not self.struct_on_non_eff else s["policy_steps"]
+            s["prune_avg_eff"] = s["prune_sum_eff"] / max(1, denom_eff)
+            s["quant_ratio_avg_eff"] = s["qratio_sum_eff"] / max(1, denom_eff)
+            s["avg_prune_keep"] = s["prune_avg_eff"]
+            s["avg_quant_ratio"] = s["quant_ratio_avg_eff"]
+            total_actions = max(1, sum(s["action_hist"]))
+            s["action_probs"] = [c / total_actions for c in s["action_hist"]]
+        return total_lp, is_greedy_all, stats
     @torch.inference_mode()
     def generate_fixed(
         self,
@@ -534,25 +772,23 @@ class PolicyLMRunner:
             "action_hist": [0] * self.A,
             "episode_len": self.episode_len,
             "dense_refresh_tail": self.dense_refresh_tail,
-            "dense_first_token": (len(cont_ids) > 0),
+            "dense_first_token": False,
         }
 
         steps_in_episode = 0
         rt = self._new_episode_state(B=1)
 
-        with torch.inference_mode():
-            past_kv, kv_len, state_lm = self._dense_prefill(torch.tensor(running, dtype=torch.long))
 
-            if len(cont_ids) > 0:
-                ids = torch.tensor(running, dtype=torch.long, device=device).unsqueeze(0)
-                out = self.m(input_ids=ids, use_cache=False, return_dict=True)
-                logprobs_next = F.log_softmax(out.logits[:, -1, :], dim=-1)
-                lp0 = float(logprobs_next[0, cont_ids[0]].item())
-                total_lp += lp0
-                running.append(cont_ids[0])
+        # Dense prefill on context only; the first continuation token will be policy-controlled
+        past_kv, kv_len, state_lm = self._dense_prefill(torch.tensor(running, dtype=torch.long))
 
         if self.dense_only:
-            for i in range(1, len(cont_ids) + 1):
+            for i in range(0, len(cont_ids)):
+                if steps_in_episode == 0 and i > 0:
+                    max_ctx = int(getattr(unwrap(self.m).config, "max_position_embeddings", 4096)) - 1
+                    pref_window = min(self.dense_refresh_tail, max_ctx, len(running))
+                    pref_ids = torch.tensor(running[-pref_window:], dtype=torch.long)
+                    past_kv, kv_len, _ = self._dense_prefill(pref_ids)
                 cur_tok = running[-1]
                 cur = torch.tensor([cur_tok], device=device, dtype=torch.long)
                 pos_ids = (kv_len - 1).clamp_min(0).unsqueeze(1)
@@ -579,31 +815,32 @@ class PolicyLMRunner:
                     stats["keep_sum_eff"] += float(kappa_now.item())
                 stats["action_hist"][self.dense_idx] += 1
 
-
-
-                labels_next = cont_ids[i] if i < len(cont_ids) else None
-                if labels_next is not None:
-                    logp = F.log_softmax(logits_step, dim=-1)[0, labels_next]
-                    total_lp += float(logp.item())
-                    greedy_tok = int(torch.argmax(logits_step, dim=-1)[0].item())
-                    if greedy_tok != labels_next:
-                        is_greedy_all = False
-                    running.append(labels_next)
+                labels_next = cont_ids[i]
+                logp = F.log_softmax(logits_step, dim=-1)[0, labels_next]
+                total_lp += float(logp.item())
+                greedy_tok = int(torch.argmax(logits_step, dim=-1)[0].item())
+                if greedy_tok != labels_next:
+                    is_greedy_all = False
+                running.append(labels_next)
+                steps_in_episode += 1
+                if steps_in_episode >= self.episode_len:
+                    steps_in_episode = 0
             stats["keep_avg_all"] = (stats["keep_sum_all"] / max(1, stats["policy_steps"]))
             stats["keep_avg_eff"] = (stats["keep_sum_eff"] / max(1, stats["effective_steps"]))
             total_actions = max(1, sum(stats["action_hist"]))
             stats["action_probs"] = [c / total_actions for c in stats["action_hist"]]
             return total_lp, is_greedy_all, stats
-        for i in range(1, len(cont_ids) + 1):
-            if steps_in_episode == 0:
-                max_ctx = int(getattr(unwrap(self.m).config, "max_position_embeddings", 4096)) - 1
-                pref_ids = torch.tensor(running[-max_ctx:], dtype=torch.long)
 
+        for i in range(0, len(cont_ids)):
+            if steps_in_episode == 0 and i > 0:
+                max_ctx = int(getattr(unwrap(self.m).config, "max_position_embeddings", 4096)) - 1
+                pref_window = min(self.dense_refresh_tail, max_ctx, len(running))
+                pref_ids = torch.tensor(running[-pref_window:], dtype=torch.long)
                 past_kv, kv_len, state_lm = self._dense_prefill(pref_ids)
                 rt = self._new_episode_state(B=1)
             cur_tok = running[-1]
             cur = torch.tensor([cur_tok], device=device, dtype=torch.long)  # [1]
-            labels_next = cont_ids[i] if i < len(cont_ids) else None
+            labels_next = cont_ids[i]
 
             scalars = self._build_scalars(
                 t_in_episode=steps_in_episode,
@@ -674,16 +911,12 @@ class PolicyLMRunner:
                 stats["prune_sum_eff"] += float(prune_now.item())
                 stats["qratio_sum_eff"] += float(qratio_now.item())
 
-            if labels_next is not None:
-                logp = F.log_softmax(logits_step, dim=-1)[0, labels_next]
-                total_lp += float(logp.item())
-
-                greedy_tok = int(torch.argmax(logits_step, dim=-1)[0].item())
-                if greedy_tok != labels_next:
-                    is_greedy_all = False
-
-                running.append(labels_next)
-
+            logp = F.log_softmax(logits_step, dim=-1)[0, labels_next]
+            total_lp += float(logp.item())
+            greedy_tok = int(torch.argmax(logits_step, dim=-1)[0].item())
+            if greedy_tok != labels_next:
+                is_greedy_all = False
+            running.append(labels_next)
             eff = eff_mask.float()
             rt.cum_eff = rt.cum_eff + eff
             rt.cum_keep = rt.cum_keep + eff * kappa_now
@@ -698,7 +931,6 @@ class PolicyLMRunner:
             steps_in_episode += 1
             if steps_in_episode >= self.episode_len:
                 steps_in_episode = 0
-
         stats["keep_avg_all"] = (stats["keep_sum_all"] / max(1, stats["policy_steps"]))
         stats["keep_avg_eff"] = (stats["keep_sum_eff"] / max(1, stats["effective_steps"]))
         total_actions = max(1, sum(stats["action_hist"]))
