@@ -1,0 +1,36 @@
+{
+  "policy": {
+    "token_keep_avg": 0.6636591587165537,
+    "token_sparsity_avg": 0.3363408412834463,
+    "prune_keep_avg": 0.7151721799720665,
+    "prune_rate_avg": 0.2848278200279335,
+    "quant_ratio_avg": 0.4745057132466936,
+    "avg_bits": 7.592091411947098,
+    "accuracy": {
+      "macro": 0.4386635649898226,
+      "per_task": {
+        "copa": 0.69,
+        "openbookqa": 0.214,
+        "race": 0.3368421052631579,
+        "winogrande": 0.5138121546961326
+      }
+    }
+  },
+  "fixed_baseline": {
+    "token_keep_avg": 0.663873525090858,
+    "token_sparsity_avg": 0.33612647490914205,
+    "prune_keep_avg": 0.7151645240305549,
+    "prune_rate_avg": 0.28483547596944514,
+    "quant_ratio_avg": 0.4744865733917737,
+    "avg_bits": 7.591785174268379,
+    "accuracy": {
+      "macro": 0.4313492313153552,
+      "per_task": {
+        "copa": 0.68,
+        "openbookqa": 0.214,
+        "race": 0.3215311004784689,
+        "winogrande": 0.5098658247829518
+      }
+    }
+  }
+}
