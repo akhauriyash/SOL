@@ -30,12 +30,18 @@ model_name: meta-llama/Llama-3.2-1B
 "grpo_level": "process",                           # process / outcome / hybrid
 
 # Lagrangian related
-"lambda_lr": 0.5,                                  # learning rate for lambda controller (identical for all)
-"lambda_init": 10.0,                               # lambda-controller initialization
+lambda_lr_token: float = 0.5
+lambda_lr_prune: float = 0.5
+lambda_lr_quant: float = 0.5
+lambda_init_token: float = 25.0                    # learning rate for lambda controller
+lambda_init_prune: float = 25.0
+lambda_init_quant: float = 25.0
 
 # Others
 "horizon": 4,                                      # look-ahead for greedy oracle (teacher)
 "pi_temperature": 1.3,                             # policy temperature
+Ts: int = 4                                        # number of "sinks tokens"
+Tw: int = 2                                        # dense sliding window
 
 ```
 
