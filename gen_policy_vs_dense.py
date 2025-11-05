@@ -141,7 +141,7 @@ def main():
         prune_bias=args.prune_bias,
         quant_bias=args.quant_bias,
     )
-    
+
     dense_model = PolicyHarnessLM(
         ckpt_dir=args.ckpt_dir,
         mode=args.mode,
@@ -189,7 +189,7 @@ def main():
     print(f"Mean logprob under dense LM -> policy: {policy_ll:.4f}, dense: {dense_ll:.4f}")
     # pprint(stats)
     print("============================\n")
-    print(f"Achieved Token-Sparsity\t{100*stats['keep_avg_eff']}%")
+    print(f"Achieved Token-Keep-Rate\t{100*stats['keep_avg_eff']}%")
     print(f"Achieved Prune-Keep\t{100*stats['prune_avg_eff']}%")
     print(f"Achieved Quant-Ratio\t{stats['quant_ratio_avg_eff']} (1 = full 16-bit)\n")
     print("============================\n")

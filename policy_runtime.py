@@ -781,7 +781,6 @@ class PolicyLMRunner:
 
         # Dense prefill on context only; the first continuation token will be policy-controlled
         past_kv, kv_len, state_lm = self._dense_prefill(torch.tensor(running, dtype=torch.long))
-
         if self.dense_only:
             for i in range(0, len(cont_ids)):
                 if steps_in_episode == 0 and i > 0:
@@ -1028,12 +1027,6 @@ class PolicyLMRunner:
                     stats["prune_sum_eff"] += float(prune_now.item())
                     stats["qratio_sum_eff"] += float(qratio_now.item())
                 stats["action_hist"][self.dense_idx] += 1
-
-                def sample_from_logits(logits):
-                    if temperature <= 0:
-                        return int(torch.argmax(logits, dim=-1)[0].item())
-                    probs = F.softmax(logits / temperature, dim=-1)
-                    return int(torch.multinomial(probs, 1)[0].item())
 
                 nxt = sample_from_logits(logits_step)
                 running.append(nxt)

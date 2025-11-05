@@ -373,11 +373,9 @@ class FixedHarnessLM(LM):
         super().__init__()
         self.ckpt_dir = ckpt_dir
         self.ckpt_path = find_latest_ckpt(ckpt_dir, mode)
-        # Unlike PolicyHarnessLM, allow running without a policy checkpoint present.
         self.cfg = load_cfg_from_checkpoint_or_yaml(ckpt_dir, self.ckpt_path)
         self.tok, self.model = load_lm_and_tokenizer(self.cfg)
 
-        # sensible default for κ if not provided: use cfg.C_target or keep_target, else 1.0
         if target_keep_effective is None:
             target_keep_effective = float(getattr(self.cfg, "C_target",
                                          getattr(self.cfg, "keep_target", 1.0)))
