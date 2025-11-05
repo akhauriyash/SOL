@@ -12,7 +12,7 @@ from torch.distributions import Categorical
 from utils.config import Config
 from utils.model import load_lm_and_tokenizer, unwrap
 from utils.masks import (
-    build_sparse_attention_bias, enable_structured_controls, set_structured_action, clear_structured_action
+    build_sparse_attention_bias, enable_structured_controls, set_structured_action, clear_structured_action, clear_relevancy_keep, clear_quest_token_budgets
 )
 from policy_runtime import PolicyLMRunner
 from utilities import find_latest_ckpt, load_cfg_from_checkpoint_or_yaml
@@ -99,6 +99,9 @@ class PolicyHarnessLM(LM):
         lam_prune = float(gs.get("lambda_prune", 0.0))
         lam_quant = float(gs.get("lambda_quant", 0.0))
 
+        value = self.tripwire_mask_changes_logits(self.model, self.cfg)
+        print(f"Tripwire check: max logits change from mask hook = {value:.6f}. Success.")
+
         self.runner = PolicyLMRunner(
             cfg=self.cfg,
             model=self.model,
@@ -134,6 +137,63 @@ class PolicyHarnessLM(LM):
             "qratio_sum_eff": 0.0,
             "action_hist": [0] * int(self.spec.n_actions),
         }
+
+    @torch.no_grad()
+    def tripwire_mask_changes_logits(self, model, cfg):
+        model.eval()
+        B = 1
+        prelen = max(8, cfg.Ts + cfg.Tw + 3)
+        prefix = torch.randint(low=0, high=512, size=(B, prelen), device=cfg.device)
+
+        out = model(input_ids=prefix, use_cache=True, return_dict=True, output_hidden_states=True)
+        past_kv_ref = out.past_key_values
+
+        x = torch.randint(low=0, high=512, size=(B, 1), device=cfg.device)
+        kv_len = torch.full((B,), prelen + 1, device=cfg.device, dtype=torch.long)
+        pos_ids = (kv_len - 1).unsqueeze(1)  # continue after prefix
+
+        keep_hi = torch.tensor([1.0], device=cfg.device)
+        keep_lo = torch.tensor([0.2], device=cfg.device)
+
+        crit = getattr(cfg, "sparsity_criteria", "recency").lower()
+
+        def forward_with_keep(keep_fracs):
+            clear_relevancy_keep(model)
+            clear_quest_token_budgets(model)
+
+            bias = build_sparse_attention_bias(
+                model=model,
+                past_kv_lens=kv_len,
+                keep_fracs=keep_fracs,
+                Ts=cfg.Ts,
+                Tw=cfg.Tw,
+                device=cfg.device,
+                dtype=model.dtype,
+                criteria=crit,
+                tier=getattr(cfg, "relevancy_tier", "per_head"),
+            )
+            kwargs = dict(
+                input_ids=x,
+                use_cache=True,
+                past_key_values=past_kv_ref,
+                position_ids=pos_ids,
+                return_dict=True,
+            )
+            if bias is not None:
+                kwargs["attention_mask"] = bias
+
+            return model(**kwargs).logits
+
+        out_hi = forward_with_keep(keep_hi)
+        out_lo = forward_with_keep(keep_lo)
+
+        if torch.allclose(out_hi, out_lo, atol=0, rtol=0):
+            raise AssertionError(
+                f"Mask hook seems inactive for criteria='{crit}'. "
+                "If using Relevancy/Quest, ensure attention impl is 'eager' and the hook is installed, "
+                "and that a causal default is applied when attention_mask is None."
+            )
+        return float((out_hi - out_lo).abs().max().item())
 
     def _record_request_stats(self, req, stats: dict):
         task = getattr(req, "task_name", "unknown")

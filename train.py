@@ -356,8 +356,10 @@ def train_one_epoch_grpo(tok,
                 phi_prev_feat.unsqueeze(1),
             ], dim=-1)  # [BK, 12]
 
+            h_prev_for_policy = state_pol.to(torch.float32)
             logits, _value_unused, pi_state = policy.step(
-                h_lm=state_pol.to(torch.float32),
+                # h_lm=state_pol.to(torch.float32),
+                h_lm=h_prev_for_policy,
                 e_tok=tok_embed.to(torch.float32),
                 scalars=scalars,
                 state=pi_state,
@@ -431,7 +433,8 @@ def train_one_epoch_grpo(tok,
             dev_abs = (mean_keep_so_far - C_tok).abs()
             phi_now = (dev_abs - tol_tok).clamp_min(0.0)
             phi_prev = phi_now.detach()
-            h_seq_buf.append(state_pol.to(torch.float32))
+            # h_seq_buf.append(state_pol.to(torch.float32))
+            h_seq_buf.append(h_prev_for_policy)
             e_seq_buf.append(tok_embed.to(torch.float32))
             scalars_seq_buf.append(scalars)
             prev_actions_seq_buf.append(prev_action_ids)
