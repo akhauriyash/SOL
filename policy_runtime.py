@@ -13,7 +13,7 @@ from torch.distributions import Categorical
 from utils.config import Config
 from utils.model import load_lm_and_tokenizer, unwrap
 from utils.masks import (
-    build_sparse_attention_bias, enable_structured_controls, set_structured_action, clear_structured_action
+    build_sparse_attention_bias, enable_structured_controls, set_structured_action, clear_structured_action, clear_quest_token_budgets, clear_relevancy_keep
 )
 from predictor import RecurrentActorCriticPolicy
 from utils.actions import build_action_spec
