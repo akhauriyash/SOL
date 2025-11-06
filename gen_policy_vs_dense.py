@@ -47,6 +47,54 @@ def set_seed(seed: int | None):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+def generate_once_true_dense_from_cfg(
+    cfg,
+    prompt: str,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float | None,
+    top_k: int | None,
+) -> str:
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+
+    # Minimal, vanilla load directly from cfg.model_name
+    tok = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True, trust_remote_code=True)
+
+    load_kwargs = {"trust_remote_code": True}
+    dt = getattr(cfg, "dtype", None)
+    if dt is not None:
+        load_kwargs["torch_dtype"] = dt
+    m = AutoModelForCausalLM.from_pretrained(cfg.model_name, **load_kwargs)
+
+    device = getattr(cfg, "device", "cuda" if torch.cuda.is_available() else "cpu")
+    m.to(device).eval()
+
+    # Encode exactly the prompt (no BOS/EOS injection, no harness preprocessing)
+    input_ids = torch.tensor([tok.encode(prompt, add_special_tokens=False)], device=device)
+
+    gen_kwargs = {"max_new_tokens": int(max_new_tokens), "do_sample": (temperature > 0.0)}
+    if temperature and temperature > 0.0:
+        gen_kwargs["temperature"] = float(temperature)
+    if top_p is not None:
+        gen_kwargs["top_p"] = float(top_p)
+    if top_k is not None:
+        gen_kwargs["top_k"] = int(top_k)
+
+    # Pass EOS/PAD ids if present, without mutating the tokenizer
+    eos_id = getattr(tok, "eos_token_id", None)
+    pad_id = tok.pad_token_id if tok.pad_token_id is not None else eos_id
+    if eos_id is not None:
+        gen_kwargs["eos_token_id"] = eos_id
+    if pad_id is not None:
+        gen_kwargs["pad_token_id"] = pad_id
+
+    with torch.no_grad():
+        out = m.generate(input_ids, **gen_kwargs)
+
+    # Return only the continuation
+    new_ids = out[0].tolist()[input_ids.shape[1]:]
+    return tok.decode(new_ids, skip_special_tokens=True)
 
 def generate_once_policy(
     model: PolicyHarnessLM,
@@ -115,7 +163,7 @@ def main():
     p.set_defaults(greedy_policy=True)
 
     p.add_argument("--episode_len", type=int, default=None, help="Override episode length (default cfg.rollout_len)")
-    p.add_argument("--dense_refresh_tail", type=int, default=None, help="Tail tokens to dense-prefill between episodes")
+    p.add_argument("--dense_refresh_tail", type=int, default=10**9, help="[disabled] Tail tokens to dense-prefill between episodes")
     p.add_argument("--batch_size", type=int, default=1, help="Internal LM-Eval wrapper batch size (safe to keep at 1)")
     p.add_argument("--seed", type=int, default=None, help="Set RNG seed for reproducibility")
     p.add_argument("--sparsity_bias", type=float, default=0,
@@ -159,8 +207,8 @@ def main():
     print(prompt)
     print("\n============================")
 
-    policy_text, stats = generate_once_policy(
-        policy_model,
+    true_dense_text = generate_once_true_dense_from_cfg(
+        policy_model.cfg,  # or dense_model.cfg — either has the same base cfg
         prompt=prompt,
         max_new_tokens=args.generation_tokens,
         temperature=args.temperature,
@@ -168,8 +216,13 @@ def main():
         top_k=args.top_k,
     )
 
-    dense_text = generate_once(
-        dense_model,
+    print("\n--- True Dense continuation ---\n")
+    print(true_dense_text)
+    print(f"\n[chars: {len(true_dense_text)}]\n")
+
+
+    policy_text, stats = generate_once_policy(
+        policy_model,
         prompt=prompt,
         max_new_tokens=args.generation_tokens,
         temperature=args.temperature,
@@ -180,6 +233,15 @@ def main():
     print("\n--- Policy (sparse) continuation ---\n")
     print(policy_text)
     print(f"\n[chars: {len(policy_text)}]")
+
+    dense_text = generate_once(
+        dense_model,
+        prompt=prompt,
+        max_new_tokens=args.generation_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+    )
 
     print("\n--- Dense baseline continuation ---\n")
     print(dense_text)

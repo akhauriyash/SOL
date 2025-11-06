@@ -34,7 +34,7 @@ def unwrap(module):
 # ----------------------------
 # Load model/tokenizer and freeze LM
 # ----------------------------
-def load_lm_and_tokenizer(cfg):
+def load_lm_and_tokenizer(cfg, dense_only=False):
     tok = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True, trust_remote_code=True)
     # Ensure model sees pad token if needed
     if tok.pad_token_id is None:
@@ -54,14 +54,15 @@ def load_lm_and_tokenizer(cfg):
         model.config.attn_implementation = "eager"
     model.eval()
     sparsity_mode = getattr(cfg, "sparsity_criteria", "recency")
-    if sparsity_mode == "relevancy":
-        from .masks import enable_relevancy_attention
+    if not dense_only:
+        if sparsity_mode == "relevancy":
+            from .masks import enable_relevancy_attention
 
-        enable_relevancy_attention(model, tier=getattr(cfg, "relevancy_tier", "per_head"), cfg=cfg)
-    elif sparsity_mode == "quest":
-        from .masks import enable_quest_attention
+            enable_relevancy_attention(model, tier=getattr(cfg, "relevancy_tier", "per_head"), cfg=cfg)
+        elif sparsity_mode == "quest":
+            from .masks import enable_quest_attention
 
-        enable_quest_attention(model, page_size=getattr(cfg, "quest_page_size", 16))
+            enable_quest_attention(model, page_size=getattr(cfg, "quest_page_size", 16))
     for p in model.parameters():
         p.requires_grad_(False)
     return tok, model

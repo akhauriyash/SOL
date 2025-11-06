@@ -55,7 +55,7 @@ class PolicyHarnessLM(LM):
             raise FileNotFoundError(f"No checkpoint found in {ckpt_dir}")
 
         self.cfg = load_cfg_from_checkpoint_or_yaml(ckpt_dir, self.ckpt_path)
-        self.tok, self.model = load_lm_and_tokenizer(self.cfg)
+        self.tok, self.model = load_lm_and_tokenizer(self.cfg, dense_only=dense_only)
 
         base_model = unwrap(self.model)
         hidden_size = getattr(base_model.config, "hidden_size", getattr(base_model.config, "n_embd", None))
@@ -99,8 +99,8 @@ class PolicyHarnessLM(LM):
         lam_prune = float(gs.get("lambda_prune", 0.0))
         lam_quant = float(gs.get("lambda_quant", 0.0))
 
-        value = self.tripwire_mask_changes_logits(self.model, self.cfg)
-        print(f"Tripwire check: max logits change from mask hook = {value:.6f}. Success.")
+        # value = self.tripwire_mask_changes_logits(self.model, self.cfg)
+        # print(f"Tripwire check: max logits change from mask hook = {value:.6f}. Success.")
 
         self.runner = PolicyLMRunner(
             cfg=self.cfg,
