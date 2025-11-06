@@ -39,7 +39,6 @@ sdp.enable_flash_sdp(False)
 sdp.enable_math_sdp(False)
 sdp.enable_mem_efficient_sdp(True)
 
-# ----------------- CLI & Eval cfg -----------------
 
 @dataclass
 class EvalCfg:
@@ -528,7 +527,6 @@ row = {
     "random_quant_ratio": float(_val(results.get("random", {}), "avg_quant_ratio", 1.0) or 1.0),
 
 
-    # --- add prune/quant keeps for all other baselines if present ---
     "drift_aware_prune_keep": float(_val(results.get("drift_aware", {}), "avg_prune_keep", 1.0) or 1.0),
     "drift_aware_quant_ratio": float(_val(results.get("drift_aware", {}), "avg_quant_ratio", 1.0) or 1.0),
 

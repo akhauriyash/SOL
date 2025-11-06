@@ -208,7 +208,7 @@ def main():
     print("\n============================")
 
     true_dense_text = generate_once_true_dense_from_cfg(
-        policy_model.cfg,  # or dense_model.cfg — either has the same base cfg
+        policy_model.cfg,
         prompt=prompt,
         max_new_tokens=args.generation_tokens,
         temperature=args.temperature,

@@ -31,7 +31,7 @@ class PolicyHarnessLM(LM):
     """
     LM-Eval-compatible wrapper that routes scoring & generation through the policy runner.
     """
-    SUPPORTED_TASKS = None  # accept all
+    SUPPORTED_TASKS = None
     REQ_CHUNK_SIZE = 1
 
     def __init__(
@@ -347,7 +347,6 @@ class PolicyHarnessLM(LM):
 
 
 
-# ---- NEW: LM-Eval wrapper for deterministic fixed baseline ----
 from policy_runtime import FixedLMRunner
 
 class FixedHarnessLM(LM):
@@ -506,7 +505,6 @@ class FixedHarnessLM(LM):
                 ctx_list.append(ctx_ids)
                 cont_list.append(cont_ids)
 
-            # NEW: batch-mixed fixed scorer (per-step mixing across the B requests)
             lp_list, greedy_list, stats_list = self.runner.score_continuation_fixed_batch(
                 ctx_list, cont_list
             )

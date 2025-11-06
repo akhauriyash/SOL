@@ -110,8 +110,6 @@ def evaluate_stateful_policy_rollout(
     pol.eval()
     m = getattr(model, "module", model)
 
-    # A = len(keep_fracs)
-    # KEEP = torch.tensor(keep_fracs, device=device, dtype=torch.float32)
     # Build composite action spec
     spec = build_action_spec(
         keep_fracs=keep_fracs,
@@ -224,9 +222,6 @@ def evaluate_stateful_policy_rollout(
             lam_keep  = torch.full_like(frac_old, float(lambda_keep))   # [B,1]
             lam_prune = torch.full_like(frac_old, float(lambda_prune))  # [B,1]
             lam_quant = torch.full_like(frac_old, float(lambda_quant))  # [B,1]
-            # scalars = torch.cat([frac_old, t_frac, lam], dim=-1).to(torch.float32)  # [B,3]
-            # --- NEW: budget-aware scalars to match training ---
-            # Stats BEFORE taking action at t
             mean_keep_prev = torch.where(cum_eff > 0, cum_keep / cum_eff, torch.zeros_like(cum_eff))  # [B]
 
             dev_prev = mean_keep_prev - C_tok                                  # signed deviation
@@ -320,7 +315,6 @@ def evaluate_stateful_policy_rollout(
                     continue
                 p_scalar = float(p_val)
                 q_scalar = int(q_val)
-                # Set global structured controls for this subgroup
                 set_structured_action(model, p_scalar, q_scalar)
 
                 cur_g      = cur.index_select(0, sel)
@@ -350,8 +344,6 @@ def evaluate_stateful_policy_rollout(
                         (B, out_g.logits.size(-1)), device=device, dtype=out_g.logits.dtype
                     )
                 logits_step.index_copy_(0, sel, out_g.logits[:, -1, :])
-                # new_cache = merge_cache_by_indices(new_cache, sel, out_g.past_key_values)
-                # Allocate expanded (L+1) cache once using subgroup shapes
                 if new_cache is None:
                     new_cache = _init_cache_container_like(out_g.past_key_values, B)
                 # Merge subgroup caches into expanded destination along batch dim
@@ -362,7 +354,6 @@ def evaluate_stateful_policy_rollout(
                 kv_len.index_add_(0, sel, torch.ones_like(sel, device=device, dtype=kv_len.dtype))
                 new_state.index_copy_(0, sel, out_g.hidden_states[-1][:, -1, :].detach())
 
-            # Clear global structured controls before the next step to prevent leakage.
             clear_structured_action(model)
 
             assert new_cache is not None, "new_cache must be allocated in subgroup loop"
@@ -373,8 +364,6 @@ def evaluate_stateful_policy_rollout(
             total_nll += nll_t.sum().item()
             total_tok += B
 
-            # Keep statistics
-            # action_hist.index_add_(0, a_eff, torch.ones_like(a_eff, dtype=torch.float32))
             action_hist.index_add_(0, a, torch.ones_like(a, dtype=torch.float32))
             has_old = eff_mask.float()
             eff_tok += int(has_old.sum().item())
@@ -428,7 +417,6 @@ def evaluate_sft_teacher_matched_keep(
     context_len: int,
     rollout_len: int,
     device: str,
-    # --- optional knobs (unchanged signature) ---
     return_assignments: bool = False,
     collect_policy_tensors: bool = False,
     lambda_keep_value: Optional[float] = None,
@@ -611,7 +599,6 @@ def evaluate_sft_teacher_matched_keep(
             # =======================
             a_star = torch.full((B,), dense_idx, device=device, dtype=torch.long)
 
-            # Compute remaining effective steps R_i for *this* step (including current)
             # T_rem = steps remaining including current: t..rollout_len-1
             T_rem = rollout_len - t
             # Non-effective steps remaining starting now:
@@ -620,7 +607,6 @@ def evaluate_sft_teacher_matched_keep(
             R = (T_rem - neff_rem).clamp_min(0).to(torch.float32)  # [B]
 
             # Required keep to finish on target (clipped to [kappa_min, kappa_max])
-            # For R==0 the value does not matter; we'll ignore it where eff_mask==0.
             c_req = (target_keep_effective * (cum_eff + R) - cum_keep) / torch.clamp(R, min=1.0)
             c_req = torch.clamp(c_req, kappa_min, kappa_max)  # [B]
 
@@ -653,7 +639,6 @@ def evaluate_sft_teacher_matched_keep(
                 idx_eff = torch.nonzero(eff_mask, as_tuple=False).squeeze(-1)
                 a_star[idx_eff] = torch.argmin(scores[idx_eff, :], dim=-1)
 
-                # For logging: "score margin" = second-best - best (>=0)
                 with torch.no_grad():
                     sorted_scores, _ = torch.sort(scores, dim=-1)
                     score_margin_all = (sorted_scores[:, 1] - sorted_scores[:, 0]).detach()
@@ -669,16 +654,11 @@ def evaluate_sft_teacher_matched_keep(
                     soft_t[idx_non, dense_idx] = 1.0
                 if eff_mask.any():
                     idx_eff = torch.nonzero(eff_mask, as_tuple=False).squeeze(-1)
-                    # Use softmax over negative scores (lower is better)
-                    # Fall back to one-hot on chosen action if scores are not available (shouldn't happen).
                     scores_eff = scores[idx_eff, :]  # [B_eff, A]
                     probs_eff = torch.softmax(-scores_eff / max(score_soft_tau, 1e-6), dim=-1)
                     soft_t[idx_eff, :] = probs_eff
                 soft_seq_buf.append(soft_t)
 
-            # Decode with chosen κ
-            # MAKE A_STAR THE LAST ACTION FOR NEXT STEP'S FEATURES
-            # a_star[~eff_mask] = dense_idx
             kappa_now = KEEP[a_star]                       # [B]
             counts_t = torch.bincount(a_star, minlength=A) # [A]
             step_action_hist[:, t] += counts_t
@@ -695,7 +675,6 @@ def evaluate_sft_teacher_matched_keep(
                 criteria=getattr(cfg, "sparsity_criteria", "recency"),
                 tier=getattr(cfg, "relevancy_tier", "per_head"),
             )
-            # import pdb; pdb.set_trace()
             out_step = model(
                 input_ids=cur.unsqueeze(1),
                 use_cache=True,
@@ -723,17 +702,14 @@ def evaluate_sft_teacher_matched_keep(
             total_keep_all += kappa_now.sum().item()
             total_keep_eff += (kappa_now * has_old).sum().item()
 
-            # Update running budget ONLY on effective steps
             eff = has_old  # [B] float in {0,1}
             cum_eff  = cum_eff  + eff
             cum_keep = cum_keep + eff * kappa_now
 
-            # optional collection for SFT training and assignments
             if return_assignments or collect_policy_tensors:
                 teacher_actions_seq_buf.append(a_star.detach())
 
             if collect_policy_tensors:
-                # Update penalty feature for next step (phi_prev)
                 mean_keep_so_far_post = torch.where(
                     cum_eff > 0, cum_keep / cum_eff, torch.zeros_like(cum_eff)
                 )
@@ -743,9 +719,7 @@ def evaluate_sft_teacher_matched_keep(
                 else:
                     phi_prev = (dev_abs_post - tol).clamp_min(0.0) ** 2
 
-                # advance prev action for next step
                 prev_action_ids = a_star.detach()
-        # end for t
 
         if return_assignments:
             teacher_actions_seq = torch.stack(teacher_actions_seq_buf, dim=0)  # [T,B]
@@ -784,7 +758,6 @@ def evaluate_sft_teacher_matched_keep(
         "action_probs": action_probs,
         "tokens": total_tok,
         "tokens_effective": eff_tok,
-        # Keep original reporting fields (neighbors around target)
         "mix_lo_k": ks_vals[lo_s],
         "mix_hi_k": ks_vals[hi_s],
         "mix_p_hi": float(p_hi),

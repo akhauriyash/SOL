@@ -399,11 +399,6 @@ def enable_relevancy_attention(model, tier: str = "per_head", cfg=None) -> None:
             if attention_mask is not None:
                 valid = attention_mask[:, :, :, :K].eq(0)  # additive mask: 0 = allowed; -inf = blocked
             else:
-                # q_idx = torch.arange(Q, device=device).view(1, 1, Q, 1)
-                # k_idx = torch.arange(K, device=device).view(1, 1, 1, K)
-                # offset = max(K - Q, 0)
-                # valid = (k_idx <= (q_idx + offset))
-                # valid = (k_idx <= q_idx)
                 valid = torch.ones((B, 1, Q, K), dtype=torch.bool, device=device)
 
             # Always-keep regions: prefix Ts and last Tw valid positions
@@ -534,10 +529,6 @@ def build_sparse_attention_bias(
     set_relevancy_keep(model, keep_fracs, tier=tier)
     return None
 
-
-# =========================
-# Structured controls (NEW)
-# =========================
 
 def _expand_to_batch(values: torch.Tensor, batch_size: int) -> torch.Tensor:
     flat = values.reshape(-1)

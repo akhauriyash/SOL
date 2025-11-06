@@ -131,7 +131,6 @@ def evaluate_fixed_matched_keep(
     dense_k_idx = (keep_fracs.index(1.0) if 1.0 in keep_fracs else int(torch.argmax(KEEP).item()))
     dense_p_idx = int(torch.argmax(PRUNE).item())  # expect 1.0 in choices
     dense_q_idx = int(torch.argmax(QBITS).item())  # expect 16 in choices
-    # --- NEW: batch‑wide residual trackers for structured axes (ρ, q_ratio) ---
     cum_prune_steps: int = 0
     cum_quant_steps: int = 0
     cum_prune_sum: float = 0.0
@@ -214,7 +213,6 @@ def evaluate_fixed_matched_keep(
                 else:
                     a_k[idx_eff] = k_lo
 
-            # --- NEW: structured axes assignment uses batch‑wide residuals ---
             struct_mask = (eff_mask if not struct_on_non_eff else torch.ones_like(eff_mask))
             idx_struct = torch.nonzero(struct_mask, as_tuple=False).squeeze(-1)
             S_struct = int(idx_struct.numel())
@@ -339,7 +337,6 @@ def evaluate_fixed_matched_keep(
             total_prune_eff  += (prune_now  * gate).sum().item()
             total_qratio_eff += (qratio_now * gate).sum().item()
 
-            # --- NEW: advance batch‑wide residual trackers for structured axes ---
             s_gate = (eff_mask if not struct_on_non_eff else torch.ones_like(eff_mask)).float()
             S_this = int(s_gate.sum().item())
             if S_this > 0:
@@ -994,7 +991,6 @@ def evaluate_drift_aware_matched_keep(
                 p_hi_base = torch.where((hi_v - lo_v) > 1e-8, (c_req_pru - lo_v) / denom, torch.ones_like(c_req_pru))
                 choose_hi = (p_hi_base >= 0.5) & (hi_sorted != lo_sorted)
                 chosen_p_sorted = torch.where(choose_hi, hi_sorted, lo_sorted)
-                # --- NEW: feasibility guardrails like κ ---
                 R_post_p = (R_vec - 1.0).clamp_min(0.0)
                 target_total_p = float(target_prune_keep) * (cum_pru_steps[idx_struct] + 1.0 + R_post_p)
                 allowed_min_p = (target_total_p - cum_pru_val[idx_struct] - p_max * R_post_p).clamp(p_min, p_max)
@@ -1018,7 +1014,6 @@ def evaluate_drift_aware_matched_keep(
                 p_hi_base_q = torch.where((hi_qv - lo_qv) > 1e-8, (c_req_q - lo_qv) / denom_q, torch.ones_like(c_req_q))
                 choose_hi_q = (p_hi_base_q >= 0.5) & (hi_sorted_q != lo_sorted_q)
                 chosen_q_sorted = torch.where(choose_hi_q, hi_sorted_q, lo_sorted_q)
-                # --- NEW: feasibility guardrails like κ ---
                 R_post_q = (R_vec - 1.0).clamp_min(0.0)
                 target_total_q = float(target_quant_ratio) * (cum_q_steps[idx_struct] + 1.0 + R_post_q)
                 allowed_min_q = (target_total_q - cum_q_val[idx_struct] - q_max * R_post_q).clamp(q_min, q_max)
@@ -1407,7 +1402,6 @@ def evaluate_emc_matched_keep(
                 p_hi_base = torch.where((hi_v - lo_v) > 1e-8, (c_req_pru - lo_v) / denom, torch.ones_like(c_req_pru))
                 choose_hi = (p_hi_base >= 0.5) & (hi_sorted != lo_sorted)
                 chosen_p_sorted = torch.where(choose_hi, hi_sorted, lo_sorted)
-                # --- NEW: feasibility guardrails for prune like κ ---
                 R_post_p = (R_vec - 1.0).clamp_min(0.0)
                 target_total_p = float(target_prune_keep) * (cum_pru_steps[idx_struct] + 1.0 + R_post_p)
                 allowed_min_p = (target_total_p - cum_pru_val[idx_struct] - p_max * R_post_p).clamp(p_min, p_max)
@@ -1430,7 +1424,6 @@ def evaluate_emc_matched_keep(
                 p_hi_base_q = torch.where((hi_qv - lo_qv) > 1e-8, (c_req_q - lo_qv) / denom_q, torch.ones_like(c_req_q))
                 choose_hi_q = (p_hi_base_q >= 0.5) & (hi_sorted_q != lo_sorted_q)
                 chosen_q_sorted = torch.where(choose_hi_q, hi_sorted_q, lo_sorted_q)
-                # --- NEW: feasibility guardrails for quant ratio like κ ---
                 R_post_q = (R_vec - 1.0).clamp_min(0.0)
                 target_total_q = float(target_quant_ratio) * (cum_q_steps[idx_struct] + 1.0 + R_post_q)
                 allowed_min_q = (target_total_q - cum_q_val[idx_struct] - q_max * R_post_q).clamp(q_min, q_max)
@@ -1573,7 +1566,7 @@ def evaluate_lrm_tokens_matched_keep(
     struct_on_non_eff: bool = False,
 ):
     """
-    % https://chatgpt.com/c/6903a41c-ac20-8329-add0-49bca9e72177
+
     TS‑1. Long‑Range Mass (LRM): non-cheating baseline (token-sparsity controller).
 
     Idea:
@@ -2033,7 +2026,7 @@ def evaluate_qnr_quant_matched_keep(
     struct_on_non_eff: bool = False,     # if True, apply quant on all steps; else only after thr
 ):
     """
-    % https://chatgpt.com/c/6903a4a1-89a8-832b-8ed3-4001187e4e4a
+
     Q‑2. Quantization Noise Ratio (QNR) – "SNR guardrail from activation stats".
 
     Causal baseline that *only* switches quantization bits. Token keep/prune are fixed (dense).
@@ -2805,7 +2798,7 @@ def evaluate_ecov_prune_matched_keep(
     struct_on_non_eff: bool = False,      # prune also on non-effective steps if True
 ):
     """
-    https://chatgpt.com/c/6903a57b-3770-832e-93e8-26c632cd2910
+
     ECov pruning baseline (causal):
 
     - For each sequence, choose the current step's prune keep ρ_t from the ECov decision
@@ -3137,8 +3130,8 @@ def evaluate_dcp_prune_matched_keep(
     dcp_gamma: float = 0.35,        # bias strength toward hi/lo keep from DCP signal
 ):
     """
-    # Explanation: https://chatgpt.com/c/690779c6-8c30-832b-948d-fec988f8f5bf
-    # Discovery: https://chatgpt.com/c/6903a591-1f14-832a-9f23-3c364d5913cc
+
+
     Downstream Contribution Proxy (DCP) controller for *pruning only*, with budget matching.
 
     Assumptions:
@@ -3494,7 +3487,8 @@ def evaluate_dcp_prune_matched_keep(
                 # --- Build DCP signal for NEXT step from captured x in last MLP ---
                 # x_store: [B, hidden_size]
                 x_store = capture["store"]                                  # [B, H]
-                # hidden = silu(gate) * up  (use *dense* weights for the probe)+                # Cast probe weights/bias to x_store dtype (fp32) to avoid bf16/float mismatch
+                # hidden = silu(gate) * up  (use *dense* weights for the probe)
+                # Cast probe weights/bias to x_store dtype (fp32) to avoid bf16/float mismatch
 
                 # Use fp32 probe weights/bias to match x_store dtype
                 gate = F.linear(x_store, gate_w_f, gate_b_f)                # [B, inter]

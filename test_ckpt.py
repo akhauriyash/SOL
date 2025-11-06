@@ -416,7 +416,6 @@ row = {
     "drift_aware_ppl": float(drift_aware_matched["ppl"]),
     "emc_ppl": float(emc_matched["ppl"]),
 
-    # keep_all values (dense defaults to 1.0 since it's full tokens)
     "dense_keep_all": float(dense_full.get("avg_keep_all", 1.0)),
     "policy_keep_all": float(greedy["avg_keep_all"]),
     "sft_teacher_keep_all": float(teacher_matched["avg_keep_all"]),
@@ -425,7 +424,6 @@ row = {
     "drift_aware_keep_all": float(drift_aware_matched["avg_keep_all"]),
     "emc_keep_all": float(emc_matched["avg_keep_all"]),
 
-    # Lists written as pipe-separated strings to avoid comma conflicts
     "sparsity_levels_kappa_order": sparsity_levels,
     "policy_action_probs_kappa_order": policy_action_probs,
 }

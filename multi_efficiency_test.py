@@ -81,18 +81,14 @@ def load_cfg_from_checkpoint_or_yaml(
     Then apply only dataset-related overrides.
     """
     cfg = Config()
-    # Try the checkpoint-embedded config first
     sd_cpu = torch.load(ckpt_path, map_location="cpu")
     sd_cfg = sd_cpu.get("cfg")
     if sd_cfg:
-        # Source of truth: resolved training config from checkpoint
-        # (covers Ts/Tw, keep_fracs, context_len, rollout_len, etc.)
         print("[eval] Using training config embedded in checkpoint.")
         for k, v in sd_cfg.items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
     else:
-        # Fallback: read base YAML from meta -> ckpt_dir/code/<relpath>
         meta = sd_cpu.get("meta", None)
         if meta is None:
             meta_path = os.path.join(ckpt_dir, "train_meta.json")
@@ -119,10 +115,8 @@ def load_cfg_from_checkpoint_or_yaml(
         else:
             print("[eval] No training config in checkpoint or meta; using defaults.")
 
-    # Runtime device/dtype
     cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
     cfg.dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    # Dataset-only overrides
     if dataset_name is not None:
         cfg.dataset_name = dataset_name
     if dataset_config is not None:
@@ -131,7 +125,6 @@ def load_cfg_from_checkpoint_or_yaml(
         cfg.text_field = text_field
     if batch_size is not None:
         cfg.batch_size = batch_size
-    # Keep the same seed semantics as training unless the caller wants a different one.
     return cfg
 
 parser = argparse.ArgumentParser()
@@ -155,7 +148,6 @@ if args.mode is not None:
     E.mode = args.mode
 if args.dataset_name is not None:
     E.dataset_name = args.dataset_name
-    # keep dataset_config in sync with dataset_name
     E.dataset_config = "wikitext-2-raw-v1" if args.dataset_name == "wikitext" else "en"
 if args.sparsity_bias is not None:
     E.sparsity_bias = args.sparsity_bias
@@ -168,7 +160,6 @@ set_seed(E.seed)
 ckpt_path = find_latest_ckpt(E.CKPT_DIR, E.mode)
 if ckpt_path is None:
     raise FileNotFoundError(f"No checkpoint found in {E.CKPT_DIR}")
-# Build cfg from the training sources, then apply dataset-only overrides
 cfg = load_cfg_from_checkpoint_or_yaml(
     ckpt_dir=E.CKPT_DIR,
     ckpt_path=ckpt_path,
@@ -186,13 +177,10 @@ cfg.eval_prune_bias = float(getattr(E, "prune_bias", getattr(cfg, "eval_prune_bi
 if args.criteria is not None:
     cfg.sparsity_criteria = args.criteria
 
-# Load model & tokenizer exactly like training
 tok, model = load_lm_and_tokenizer(cfg)
 
-# Validation loader (streaming) using the same code path as training
 dl = make_dataloader(cfg, tok, split=E.split, shuffle=False, distributed=False)
 
-# Prepare policy and load checkpoint
 base_model = unwrap(model)
 hidden_size = getattr(base_model.config, "hidden_size", getattr(base_model.config, "n_embd", None))
 if hidden_size is None:
@@ -218,7 +206,6 @@ if sd_cfg is not None and "keep_fracs" in sd_cfg:
 emb_layer = unwrap(model).get_input_embeddings()
 embed_dim = getattr(emb_layer, "embedding_dim", emb_layer.weight.shape[1])
 in_dim = int(hidden_size + embed_dim + 1)
-# === Recurrent policy hyperparams (defaults; can be overridden in cfg) ===
 pol_d_model  = int(getattr(cfg, "policy_d_model", 768))
 pol_heads    = int(getattr(cfg, "policy_n_heads", 8))
 pol_layers   = int(getattr(cfg, "policy_n_layers", 2))
@@ -235,7 +222,6 @@ spec = build_action_spec(
     prune_choices=cfg.struct_prune_choices,
     quant_choices=cfg.quant_choices,
 )
-# policy = ActorCriticPolicy(in_dim=in_dim, n_actions=len(cfg.keep_fracs)).to(cfg.device, dtype=torch.float32)
 policy = RecurrentActorCriticPolicy(
     h_dim=int(hidden_size),
     e_dim=int(embed_dim),
@@ -316,7 +302,7 @@ fixed_matched = evaluate_fixed_matched_keep(
     context_len=cfg.context_len,
     rollout_len=cfg.rollout_len,
     device=cfg.device,
-    struct_on_non_eff=False,   # set True if your training budgets used all steps
+    struct_on_non_eff=False,
 )
 total_time = time.time() - start_time
 print(

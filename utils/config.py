@@ -65,7 +65,6 @@ class Config:
     Tw: int = 1                      # trailing dense window
     keep_fracs: Tuple[float, ...] = (0.05, 0.3, 0.6, 0.85, 1.0)  # κ actions
 
-    # NEW: structural & quantization action choices (strings).
     # Pruning: s40 -> keep 60% of channels, s70 -> keep 30%, s100 -> keep 100% (no pruning)
     struct_prune_choices: Tuple[str, ...] = ("s100",)
     # Quantization: q4/q8/q16 (16 -> identity)

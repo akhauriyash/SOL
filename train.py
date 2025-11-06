@@ -107,9 +107,9 @@ def train_one_epoch_grpo(tok,
     policy.train()
 
     K = int(getattr(cfg, "grpo_rollouts_per_input", 16))
-    grpo_level = str(getattr(cfg, "grpo_level", "process")).lower()     # "process" or "outcome"
-    grpo_norm  = str(getattr(cfg, "grpo_norm", "center")).lower()       # "center" or "zscore"
-    adv_whiten_global = bool(getattr(cfg, "adv_whiten_global", True))   # final global whitening
+    grpo_level = str(getattr(cfg, "grpo_level", "process")).lower()
+    grpo_norm  = str(getattr(cfg, "grpo_norm", "center")).lower()
+    adv_whiten_global = bool(getattr(cfg, "adv_whiten_global", True))
     ppo_clip = float(getattr(cfg, "ppo_clip", 0.2))
     mb_size = int(getattr(cfg, "ppo_minibatch_size", 512))
     target_N = int(getattr(cfg, "ppo_target_batch_size", 2048))
@@ -148,18 +148,16 @@ def train_one_epoch_grpo(tok,
         global_step_state = {"micro": 0, "update": 0}
 
     # Initialize dual variables
-    global_step_state.setdefault("lambda_keep",  init_tok)  # token keep
-    global_step_state.setdefault("lambda_prune", init_pru)  # prune keep
-    global_step_state.setdefault("lambda_quant", init_q)    # quant ratio
+    global_step_state.setdefault("lambda_keep",  init_tok)
+    global_step_state.setdefault("lambda_prune", init_pru)
+    global_step_state.setdefault("lambda_quant", init_q)
 
-    # Build composite action space (token_keep × prune_keep × q_bits)
     action_spec = build_action_spec(
         keep_fracs=cfg.keep_fracs,
         prune_choices=getattr(cfg, "struct_prune_choices", ("s100",)),
         quant_choices=getattr(cfg, "quant_choices", ("q16",)),
     )
     A = action_spec.n_actions
-    # Normalize pruning to a 0..1 ratio for all constraint math (model still receives raw values)
     P_MAX = float(max(action_spec.prune_keep)) if len(action_spec.prune_keep) > 0 else 1.0
 
     has_prune_dof = len(set(action_spec.prune_keep)) > 1
@@ -504,18 +502,16 @@ def train_one_epoch_grpo(tok,
         rag   = getattr(cfg, "reward_agg", None)
         gamma = float(getattr(cfg, "reward_gamma", 0.82))
 
-        x_for_adv = r_task_all  # default: no aggregation
+        x_for_adv = r_task_all
         if rag in ("sum", "max") and 0.0 <= gamma < 1.0:
             T, BK = r_task_all.shape
             returns = torch.zeros_like(r_task_all)
             if rag == "sum":
-                # R_t = sum_{i=t}^{T-1} gamma^{i-t} r_i
                 running = torch.zeros(BK, device=r_task_all.device, dtype=r_task_all.dtype)
                 for t in range(T - 1, -1, -1):
                     running = r_task_all[t] + gamma * running
                     returns[t] = running
             else:  # rag == "max"
-                # R_t = max_{i>=t} gamma^{i-t} r_i  (reverse scan with discounted running max)
                 running_best = torch.full((BK,), float("-inf"),
                                           device=r_task_all.device, dtype=r_task_all.dtype)
                 for t in range(T - 1, -1, -1):
@@ -538,7 +534,6 @@ def train_one_epoch_grpo(tok,
         mean_qratio_seq= (eff_all * qratio_all).sum(dim=0) / sum_eff_seq  # [BK]
         alpha_c = float(getattr(cfg, "cost_tradeoff_alpha", 1.0))
 
-        # ---- Multi-constraint mixing (token, prune, quant) ----
         d_tok = (mean_keep_seq - (C_tok + tol_tok)).clamp_min(0.0)         # [BK]
         s_tok = torch.where(mean_keep_seq > C_tok + tol_tok,
                             torch.tensor(1.0, device=device),

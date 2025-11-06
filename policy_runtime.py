@@ -44,21 +44,13 @@ def match_stop_suffix(gen_ids, stop_seqs):
     return 0
 
 def _tok_str(tok, tok_id: int) -> str:
-    # shows the *token piece* as HF sees it (e.g., "Ġword", "##ing", bytes like "<0xC3>")
     return tok.convert_ids_to_tokens([tok_id])[0]
 
 def _decode_tail(tok, ids: list[int], n: int = 30) -> str:
-    # human view of the last few *characters*
     return tok.decode(ids[-n:], skip_special_tokens=False, clean_up_tokenization_spaces=False)
 
 
-# ---- NEW: Deterministic fixed baseline runner (match κ/ρ/bits targets) ----
 class FixedLMRunner:
-    """
-    Deterministic, policy-free runner that mixes between the two nearest discrete
-    choices on each axis (token keep κ, prune keep ρ, quant bits) to match
-    user-provided targets over time (running residual rule).
-    """
     def __init__(
         self,
         cfg: Config,
@@ -91,8 +83,6 @@ class FixedLMRunner:
         self.spec = spec
         enable_structured_controls(self.m)
 
-        # Axes (unique values) — derive from flattened grid while preserving the
-        # original build_action_spec order (k outer, then p, then q).
         def _uniq_in_order(seq):
             out = []
             seen = set()
@@ -107,10 +97,8 @@ class FixedLMRunner:
         self._qbits_axis = [int(x) for x in _uniq_in_order(self.spec.q_bits)]
 
         self.K, self.P, self.Q = len(self._keep_axis), len(self._prune_axis), len(self._qbits_axis)
-        # Derived ratios for quantization (clamp min 1/16)
         self._qratio_axis: List[float] = [max(1.0, float(b)) / 16.0 for b in self._qbits_axis]
 
-        # Densest indices (for non-effective steps unless overridden)
         self._dense_k = (self._keep_axis.index(1.0) if 1.0 in self._keep_axis
                          else int(max(range(self.K), key=lambda i: self._keep_axis[i])))
         self._dense_p = int(max(range(self.P), key=lambda i: self._prune_axis[i]))    # expect 1.0
@@ -163,9 +151,7 @@ class FixedLMRunner:
                          target: float, cum_sum: float, cum_steps: int) -> int:
         if lo_idx == hi_idx:
             return lo_idx
-        # value needed this step to keep running average near the target
         req = (target * (cum_steps + 1) - cum_sum)
-        # Pick whichever discrete endpoint is closer to the required value
         return hi_idx if abs(hi_v - req) < abs(lo_v - req) else lo_idx
 
     @torch.inference_mode()
@@ -183,7 +169,6 @@ class FixedLMRunner:
         last_logits = out.logits[:, -1, :]
         return past_kv, kv_len, last_h, last_logits
 
-    # ---- public API used by harness ----
     @torch.inference_mode()
     def score_continuation_fixed(self, ctx_ids: List[int], cont_ids: List[int]) -> Tuple[float, bool, dict]:
         device = self.device
@@ -191,7 +176,6 @@ class FixedLMRunner:
         total_lp = 0.0
         is_greedy_all = True
 
-        # reset residuals for a new request
         self._cum_eff_steps = 0
         self._cum_keep_sum = 0.0
         self._cum_struct_steps = 0
@@ -214,11 +198,9 @@ class FixedLMRunner:
         }
 
         steps_in_episode = 0
-        # Dense prefill on *context only*; all continuation tokens will use fixed κ/ρ/q
         past_kv, kv_len, _state_lm = self._dense_prefill(torch.tensor(running, dtype=torch.long))
 
         for i in range(0, len(cont_ids)):
-            # episodic re-densify using the configured tail (skip on very first step since we just prefetched)
             if steps_in_episode == 0 and i > 0:
                 max_ctx = int(getattr(unwrap(self.m).config, "max_position_embeddings", 4096)) - 1
                 pref_window = min(self.dense_refresh_tail, max_ctx, len(running))
@@ -230,7 +212,6 @@ class FixedLMRunner:
 
             eff_mask = (kv_len > self.thr).item()
 
-            # Choose κ/ρ/bits for this step
             if eff_mask:
                 k_idx = self._choose_axis_idx(self.k_lo, self.k_hi, self.k_lo_v, self.k_hi_v,
                                               self.t_keep, self._cum_keep_sum, self._cum_eff_steps)
@@ -250,7 +231,6 @@ class FixedLMRunner:
             qbits_now = torch.tensor([self._qbits_axis[q_idx]], device=device, dtype=torch.int64)
             qratio_now = qbits_now.to(torch.float32).clamp_(min=1.0) / 16.0
 
-            # Attention bias + structured controls
             pos_ids = (kv_len - 1).clamp_min(0).unsqueeze(1)
             bias = build_sparse_attention_bias(
                 model=self.m,
@@ -405,7 +385,6 @@ class FixedLMRunner:
             else:
                 struct_mask = eff_mask[:]
 
-            # ---- Choose κ across the effective subset (residual-corrected) ----
             k_idx_sel = [self._dense_k] * len(live)  # defaults for non-effective tokens
             S_eff = sum(1 for f in eff_mask if f)
             if S_eff > 0:
@@ -430,7 +409,6 @@ class FixedLMRunner:
                 cum_keep_sum += float(keep_sum_step)
                 cum_eff_steps += S_eff
 
-            # ---- Choose ρ and q across the structural subset ----
             p_idx_sel = [self._dense_p] * len(live)
             q_idx_sel = [self._dense_q] * len(live)
             S_struct = sum(1 for f in struct_mask if f)
@@ -478,7 +456,6 @@ class FixedLMRunner:
                 cum_qratio_sum += float(qratio_sum_step)
                 cum_struct_steps += S_struct
 
-            # ---- Execute each live item with its assigned endpoints ----
             for pos, i in enumerate(live):
                 cur_tok = running[i][-1]
                 cur = torch.tensor([cur_tok], device=device, dtype=torch.long)
@@ -544,12 +521,10 @@ class FixedLMRunner:
                     is_greedy_all[i] = False
                 running[i].append(labels_next)
 
-                # episodic refresh per-sample (use dense_refresh_tail) before the *next* step
                 steps_in_episode[i] += 1
                 if steps_in_episode[i] >= self.episode_len:
                     max_ctx = int(getattr(unwrap(self.m).config, "max_position_embeddings", 4096)) - 1
                     pref_window = min(self.dense_refresh_tail, max_ctx, len(running[i]))
-                    # Pre-fill tail BUT EXCLUDE the current last token so the next step is optimized
                     if pref_window > 1:
                         tail_except_last = running[i][-pref_window:-1]
                         if len(tail_except_last) > 0:
@@ -559,7 +534,6 @@ class FixedLMRunner:
                         else:
                             past_kv[i], kv_len[i] = None, torch.tensor([0], device=device)
                     else:
-                        # No prefix to prefill; start next step with the last token fed under controls
                         past_kv[i], kv_len[i] = None, torch.tensor([0], device=device)
                     steps_in_episode[i] = 0
 
@@ -590,9 +564,6 @@ class FixedLMRunner:
         top_k: Optional[int] = None,
         return_stats: bool = False,
     ):
-        # Simple wrapper that mirrors score_continuation_fixed but samples tokens.
-        # For brevity and to keep this patch focused on evaluation, we route generation
-        # through score_continuation_fixed semantics by sampling greedily/logits.
         device = self.device
         running = ctx_ids[:]
         stats_dummy = {"policy_steps": 0, "effective_steps": 0, "keep_sum_all": 0.0, "keep_sum_eff": 0.0,
@@ -602,10 +573,8 @@ class FixedLMRunner:
                        "keep_avg_all": 1.0, "keep_avg_eff": 1.0, "prune_avg_all": 1.0, "prune_avg_eff": 1.0,
                        "quant_ratio_avg_all": 1.0, "quant_ratio_avg_eff": 1.0, "avg_prune_keep": 1.0,
                        "avg_quant_ratio": 1.0, "action_probs": [0.0] * int(self.spec.n_actions)}
-        # A compact but deterministic path: use zero-length cont_ids and step greedily max_new_tokens times
-        # via the same stepping logic as score_continuation_fixed; omitted for brevity during eval-only flows.
-        # Many lm-eval tasks do not invoke generation for this setup.
-        return (running[len(ctx_ids):], stats_dummy) if return_stats else running[len(ctx_ids):]
+        raise NotImplementedError("generate_fixed is not implemented in FixedLMRunner")
+        # return (running[len(ctx_ids):], stats_dummy) if return_stats else running[len(ctx_ids):]
 
 class PolicyLMRunner:
     def __init__(
@@ -650,12 +619,10 @@ class PolicyLMRunner:
         self.dense_idx = int(spec.dense_idx)
         enable_structured_controls(self.m)
         self._scalar_dim = int(getattr(self.pol, "scalar_dim", 12))
-        # Positive biases => prefer more aggressive actions;
-        # negative => prefer denser / higher-precision actions.
         self.sparsity_bias = float(sparsity_bias)
         self.prune_bias    = float(prune_bias)
         self.quant_bias    = float(quant_bias)
-        self._logit_bias: Optional[torch.Tensor] = None  # [1, A] on device
+        self._logit_bias: Optional[torch.Tensor] = None
         if (self.sparsity_bias != 0.0) or (self.prune_bias != 0.0) or (self.quant_bias != 0.0):
             def _norm01(x: torch.Tensor) -> torch.Tensor:
                 x = x.to(torch.float32)
@@ -664,15 +631,15 @@ class PolicyLMRunner:
                 denom = torch.clamp(xmax - xmin, min=1e-8)
                 return (x - xmin) / denom
 
-            dens_keep  = _norm01(self.KEEP)                        # 0 = lowest keep, 1 = densest
-            dens_prune = _norm01(self.PRUNE)                       # 0 = most pruned, 1 = s100
-            dens_qbits = _norm01(self.QBITS.to(torch.float32))     # 0 = lowest bits, 1 = max bits
+            dens_keep  = _norm01(self.KEEP)
+            dens_prune = _norm01(self.PRUNE)
+            dens_qbits = _norm01(self.QBITS.to(torch.float32))
             bias_vec = (
                 self.sparsity_bias * dens_keep
                 + self.prune_bias  * dens_prune
                 + self.quant_bias  * dens_qbits
             )  # [A]
-            self._logit_bias = bias_vec.unsqueeze(0).to(self.device)  # [1, A]
+            self._logit_bias = bias_vec.unsqueeze(0).to(self.device)
 
         self.greedy_policy = bool(greedy_policy)
         self.pi_temperature = float(policy_temperature)
@@ -720,13 +687,6 @@ class PolicyLMRunner:
         )
 
     def _build_scalars(self, t_in_episode: int, kv_len: torch.Tensor, rt: PolicyRuntimeState, steps_seen: int, total_steps_target: int):
-        """
-        Build scalar feature vector.
-        - If the loaded policy expects 12 dims, emit:
-          [frac_old, t_frac, λ_keep, λ_prune, λ_quant, eff_flag, mean_keep_prev,
-           dev_norm_prev, gap_prev, steps_rem_frac, eff_count_norm, phi_prev]
-        - Otherwise fall back to the 10-dim vector.
-        """
         win = float(self.Ts + self.Tw + 1)
         frac_old = torch.full((1,1), min(float(t_in_episode), win) / win, device=self.device, dtype=torch.float32)
         t_frac   = torch.full_like(frac_old, 2.0 * (float(t_in_episode) / float(self.episode_len)) - 1.0)
@@ -791,14 +751,6 @@ class PolicyLMRunner:
         greedy_actions: bool = True,
         policy_temperature: float = 0.7,
     ) -> Tuple[float, bool, dict]:
-        """
-        Returns (sum_logprobs, is_greedy_all, stats_dict), where is_greedy_all is True if
-        the continuation equals the argmax path under the LM (not policy actions).
-        We compute token logprobs under policy-controlled sparse decoding.
-
-        Episodic: after every `episode_len` continuation tokens, we re-densify
-        the KV by prefilling the last `dense_refresh_tail` tokens of the running text.
-        """
         device = self.device
         ctx_len = len(ctx_ids)
         assert ctx_len > 0, "score_continuation_with_policy requires non-empty ctx_ids to make token-0 policy-controlled"

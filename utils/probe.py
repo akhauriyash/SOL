@@ -54,14 +54,6 @@ def probe_losses_with_lookahead(
       - metric="lookahead_ce": sum of label CE over the next H steps under the action dynamics.
       - metric="dense_kl":    sum over h of KL( p_dense_{t+h} || p_action_{t+h} ), comparing
                               the dense rollout logits to those under the action dynamics.
-
-
-    Notes
-
-So, lets focus on the problem of sparsity. The thing is, our probe_losses_with_lookahead is the 'deciding' metric, of whether an action si good or not, which constructs our training for the predictor
-
-However, this is a _very_ sensitive metric _WITHIN_ a rollout. To be specific. When we have a rollout of 16 steps, the first step can be EXTREMELY sparse, because what we observe is, the model does not immediately need a very old token, instead, it relies on the previous tokens 'summary' of those tokens in  its KV Cache. So, the impact of token sparsity is not immediately visible in that step. I believe it is visible later on. This is hypothesis, ofcourse.
-
     """
     B = cur.size(0)
     A = len(keep_fracs)
@@ -107,7 +99,6 @@ However, this is a _very_ sensitive metric _WITHIN_ a rollout. To be specific. W
         dense_logprobs.append(F.log_softmax(out_d0.logits[:, -1, :], dim=-1))
         cache_d = out_d0.past_key_values
         kv_len_d = kv_len_d + 1
-        # h = 1..max_h-1
         for h in range(1, max_h):
             tok_h = fut_tokens[:, h]
             pos_ids_dh = (kv_len_d - 1).clamp_min(0).unsqueeze(1)
@@ -129,12 +120,10 @@ However, this is a _very_ sensitive metric _WITHIN_ a rollout. To be specific. W
             kv_len_d = kv_len_d + 1
 
     for a_idx, kap in enumerate(kap_list):
-        # branch from the *same* starting cache/kv_len
         cache_a = detach_cache_to_tuple(past_kv_live)
         kv_len_a = kv_len.clone()
         loss_sum = torch.zeros((B,), device=device)
 
-        # ---- h = 0 : evaluate action a on current token ----
         pos_ids = (kv_len_a - 1).clamp_min(0).unsqueeze(1)
         bias0 = build_sparse_attention_bias(
             model=model,
@@ -154,7 +143,6 @@ However, this is a _very_ sensitive metric _WITHIN_ a rollout. To be specific. W
             position_ids=pos_ids,
             attention_mask=bias0,
             return_dict=True,
-            # for policy lookahead we need the state
             output_hidden_states=(future_mask_rule == "policy"),
         )
         logits0 = out0.logits[:, -1, :]
@@ -178,7 +166,6 @@ However, this is a _very_ sensitive metric _WITHIN_ a rollout. To be specific. W
             lab_h = fut_labels[:, h]
 
             if future_mask_rule == "repeat":
-                # keep using the same κ 'a'
                 kap_h = kap
             elif future_mask_rule == "policy" and (policy_for_future is not None) and (emb_layer is not None) and (KEEP is not None):
                 # --- Policy-aware: pick κ using frozen Δ-policy with feasibility-then-cost rule ---
@@ -249,5 +236,4 @@ However, this is a _very_ sensitive metric _WITHIN_ a rollout. To be specific. W
             kv_len_a = kv_len_a + 1
         losses.append(loss_sum)
 
-    # [B, A], average over the actually simulated horizon
     return torch.stack(losses, dim=-1) / float(max_h)
