@@ -37,6 +37,8 @@ class Config:
     epochs: int = 5
     seed: int = 1234
     eval_sparsity_bias: float = 0.0
+    eval_quant_bias: float = 0.0
+    eval_prune_bias: float = 0.0
     quest_page_size: int = 16
 
     algo: str = "grpo"
@@ -50,8 +52,15 @@ class Config:
     kl_pi_ref_coef: float = 0.0  # turn on if you want π vs π_ref regularization
     reward_gamma: float = 0.82
     tol_token: float = 0.01
-    tol_prune: float = 0.01
-    tol_quant_bits: float = 0.01
+    tol_prune: float = 0.05
+    tol_quant_bits: float = 1.0
+    keep_tolerance: float = 0.01
+    budget_tolerance: float = 0.1
+    budget_penalty: str = "linear"
+    budget_steer_beta: float = 0.5
+    steer_beta: float = 0.5
+    margin_soft_tau: float = 0.5
+    score_soft_tau: float = 0.5
 
     lambda_lr_token: float = 0.5
     lambda_lr_prune: float = 0.5
@@ -70,14 +79,15 @@ class Config:
     # Quantization: q4/q8/q16 (16 -> identity)
     quant_choices: Tuple[str, ...] = ("q16",)
     keep_target: float = 0.3         # budget target (a.k.a. C_target)
+    C_target_token: float = 0.3
     # Optional explicit alias; if None, code falls back to keep_target
     C_target: Optional[float] = None
     sparsity_criteria: str = "recency"   # "recency" | "relevancy" | "quest"
     relevancy_tier: str = "per_head"     # "per_head" | "per_layer"
 
     enable_prune_quant: bool = False
-    C_target_prune: Optional[float] = None      # if set, overrides keep_target for pruning budget
-    C_target_quant_bits: Optional[int] = None   # e.g., 16, 8, 4; None -> derive from quant_choices
+    C_target_prune: float = 0.70      # overrides keep_target for pruning budget
+    C_target_quant_bits: float = 8.0   # e.g., 16, 8, 4
     # --- Sequence lengths / batching ---
     context_len: int = 512           # dense prefill length
     rollout_len: int = 16            # on-policy window length
@@ -85,6 +95,8 @@ class Config:
     grad_accum_steps: int = 1
     max_grad_norm: float = 1.0
     lr: float = 3e-4
+    sft_min_lr: float = 5e-5
+    _sft_total_updates: int = 0
 
     # --- PPO / RL hyperparams (all read via getattr in training loop) ---
     ppo_clip: float = 0.2
@@ -97,7 +109,10 @@ class Config:
     gae_lambda: float = 0.9
     pi_temperature: float = 0.7
     lambda_lr: float = 1e-2
-    lambda_init: float = 0.5
+    lambda_init: float = 0.0
+    lambda_max: float = 20000.0
+    lambda_ema_beta: float = 0.9
+    cost_tradeoff_alpha: float = 1.0
 
     # --- Recurrent policy network hyperparams ---
     policy_d_model: int = 768
@@ -106,6 +121,7 @@ class Config:
     policy_mlp_ratio: float = 4.0
     policy_action_dim: int = 32
     policy_max_len: int = 1024
+    policy_scalar_dim: int = 12
     policy_dropout: float = 0.0
     policy_tbptt_k: int = 0
 
