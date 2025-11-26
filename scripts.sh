@@ -1,3 +1,11 @@
+
+### New Longer Runs
+torchrun --nproc_per_node=1 --master_port 29510 train.py   \
+  --wandb_project SOL     --wandb_run_name RL_LCE_Quest4    \
+   --config /home/ya255/SOL/official_configs/RL_LCE_Quest4.yml
+
+
+
 # To evaluate policy on WikiText.
 python test_ckpt.py --ckpt_dir /home/ya255/SOL/checkpoints/RL_LCE_Quest4-20251028-213126 \
   --mode "latest" --dataset_name wikitext

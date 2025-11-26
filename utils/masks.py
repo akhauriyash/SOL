@@ -598,6 +598,7 @@ def enable_structured_controls(model, *, apply_to_attention_input: bool = True) 
             k_counts = (keep * D).ceil().clamp_(1, D).to(torch.int64)  # [B]
             # score per channel = max |activation| across tokens in this call
             scores = hidden_states.abs().amax(dim=1)  # [B, D]
+            # scores = hidden_states.pow(2).mean(dim=1).sqrt() 
             max_k = int(k_counts.max().clamp(1, D).item())
             topk_vals, _ = torch.topk(scores, k=max_k, dim=-1)
             row = torch.arange(B, device=hidden_states.device)
@@ -606,12 +607,7 @@ def enable_structured_controls(model, *, apply_to_attention_input: bool = True) 
             return hidden_states * mask  # broadcast across T
 
         def decoder_forward_with_struct(module, *args, **kwargs):
-            # args: (hidden_states, attention_mask, position_ids, past_key_value, ...)
-            hidden_states = args[0]
-            keep = getattr(module, "_struct_prune_keep", None)
-            if apply_to_attention_input and (keep is not None):
-                hidden_states = _apply_channel_prune(hidden_states, keep)
-                args = (hidden_states,) + args[1:]
+            # No pruning at decoder input: Q/K/V stay dense
             return orig_layer_forward(module, *args, **kwargs)
 
         llama_mod._struct_prev_decoderlayer_forward = orig_layer_forward
@@ -620,12 +616,17 @@ def enable_structured_controls(model, *, apply_to_attention_input: bool = True) 
     # Patch MLP once
     if not hasattr(llama_mod, "_struct_prev_mlp_forward"):
         orig_mlp_forward = llama_mod.LlamaMLP.forward
-
         def mlp_forward_with_struct(module, hidden_states, *args, **kwargs):
+            # 1) Optional pruning on MLP input ONLY (doesn't touch attention)
+            keep = getattr(module, "_struct_prune_keep", None)
+            if keep is not None:
+                hidden_states = _apply_channel_prune(hidden_states, keep)
+
+            # 2) Optional quantization (your existing logic)
             bits = getattr(module, "_struct_quant_bits", None)
             if bits is None:
                 return orig_mlp_forward(module, hidden_states, *args, **kwargs)
-            # Quantize activations safely
+
             x_q = _fake_quantize_batched(hidden_states, bits)
             gate = module.gate_proj(x_q)
             up   = module.up_proj(x_q)
@@ -645,6 +646,7 @@ def enable_structured_controls(model, *, apply_to_attention_input: bool = True) 
             module._struct_prune_keep = None  # torch.Tensor per-batch or None
         if isinstance(module, llama_mod.LlamaMLP):
             module._struct_quant_bits = None  # torch.Tensor[int] per-batch or None
+            module._struct_prune_keep = None  # NEW: MLP-level prune control
     model._structured_controls_enabled = True
 
 

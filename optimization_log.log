@@ -1,0 +1,56 @@
+First pass on quant strategy, with q3-q16 choices, random alloc
+# target was 0.5, so 16 bits. Ideally, should be nearly lossless.
+
+Good. 
+# q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16 \
+# 0.5 target.
+
+Dense baseline          : ppl=9.811  tokens=1792
+Random alloc            : ppl=9.868  keep_all=1.000  keep_eff=1.000  prune_keep=1.000  quant_ratio=8.000  tokens=1792/1792
+# q3,q10,q11,q12,q13,q14,q15,q16
+# 0.5 target. (requires v.low bit-width choices.)
+Random alloc            : ppl=67.514  keep_all=1.000  keep_eff=1.000  prune_keep=1.000  quant_ratio=7.812  tokens=1792/1792
+# q4,q10,q11,q12,q13,q14,q15,q16
+# 0.5 target. (requires v.low bit-width choices.)
+Random alloc            : ppl=16.894  keep_all=1.000  keep_eff=1.000  prune_keep=1.000  quant_ratio=8.125  tokens=1792/1792
+
+# 4 bit is really bad. Lets try to make it better.
+# Quantized only the fused activation.
+Random alloc            : ppl=15.253  keep_all=1.000  keep_eff=1.000  prune_keep=1.000  quant_ratio=8.125  tokens=1792/1792
+
+# 5 bit with fused activations is pretty good. 
+Random alloc            : ppl=11.588  keep_all=1.000  keep_eff=1.000  prune_keep=1.000  quant_ratio=8.125  tokens=1792/1792
+
+# 6 bit with fused activation approach, target is still 8 bits. 
+Random alloc            : ppl=10.157  keep_all=1.000  keep_eff=1.000  prune_keep=1.000  quant_ratio=8.000  tokens=1792/1792
+
+# Approach here seems to be, to give most bits per-step. 
+# what if we give all options, q6 to q16?
+
+### OVERALL, it seems to be loss-less, we need to simply have more bit options
+# and then try to hit the target. thats it.
+
+
+### New pruning strategy which leaves the attn block alone
+# Earlier version had 17.906 with prune-rage 0.438
+
+# s10 to s100, target 0.44 
+Hits 0.438 with ppl 13.855
+
+# abs.amax --> pow2.mean().sqrt
+Hits 0.438 with ppl 13.855 (interesting)
+
+# s10 to s100, target 0.64
+perplexity 10.551
+
+# with token-sparsity on Quest8 down to 0.4 keep rate
+perplexity 11.268
+
+# with Quest4, down to 0.4 keep rate 
+perplexity 10.021
+
+
+A good overall optimization profile, seems to be 
+Pruning down to 0.65;                   with targets s30 to s100
+Quantization down to 6 bits (0.375)     with targets q6 to q16
+Token Sparsity down to 0.4              with targets t20 to t100          
