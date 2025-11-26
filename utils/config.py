@@ -21,7 +21,6 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.cache_utils import DynamicCache
 
 import numpy as np
-import wandb
 from tqdm import tqdm
 from itertools import islice
 from argparse import ArgumentParser

@@ -185,7 +185,7 @@ sympy==1.13.1
     # via torch
 tokenizers==0.22.1
     # via transformers
-torch==2.6.0+cu124
+torch
     # via
     #   accelerate
     #   rl4e
