@@ -120,7 +120,7 @@ class Config:
     policy_mlp_ratio: float = 4.0
     policy_action_dim: int = 32
     policy_max_len: int = 1024
-    policy_scalar_dim: int = 12
+    policy_scalar_dim: int = 8
     policy_dropout: float = 0.0
     policy_tbptt_k: int = 0
 

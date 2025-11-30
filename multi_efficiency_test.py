@@ -132,6 +132,7 @@ parser.add_argument("--ckpt_dir", type=str, default=None)
 parser.add_argument("--mode", type=str, default=None)
 parser.add_argument("--tgt_keep", type=float, default=None)
 parser.add_argument("--criteria", type=str, default=None)
+parser.add_argument("--outp", type=str, default="")
 parser.add_argument("--dataset_name", type=str, choices=["wikitext", "allenai/c4"], default=None)
 parser.add_argument("--sparsity_bias", type=float, default=None,
                     help="Positive values bias the policy toward sparser actions during eval.")
@@ -215,7 +216,7 @@ pol_max_len  = int(getattr(cfg, "policy_max_len", max(1024, cfg.rollout_len + 8)
 lam = float(sd.get("global_step_state", {}).get("lambda_keep", 0.0))
 lamprune = float(sd.get("global_step_state", {}).get("lambda_prune", 0.0))
 lamquant = float(sd.get("global_step_state", {}).get("lambda_quant", 0.0))
-SCALAR_D = int(getattr(cfg, "policy_scalar_dim", 12))
+SCALAR_D = int(getattr(cfg, "policy_scalar_dim", 8))
 
 spec = build_action_spec(
     keep_fracs=cfg.keep_fracs,
@@ -343,6 +344,8 @@ if 'action_probs' in fixed_matched:
 import csv
 
 csv_path = "multi_eff_ppl_scan.csv"
+if args.outp != "":
+    csv_path = args.outp + "_multi_eff_ppl_scan.csv"
 
 ckpt_dir_last = os.path.basename(os.path.normpath(E.CKPT_DIR))
 

@@ -70,7 +70,7 @@ class PolicyHarnessLM(LM):
         pol_mlp_mult = float(getattr(self.cfg, "policy_mlp_ratio", 4.0))
         pol_act_dim  = int(getattr(self.cfg, "policy_action_dim", 32))
         pol_max_len  = int(getattr(self.cfg, "policy_max_len", max(1024, self.cfg.rollout_len + 8)))
-        SCALAR_D     = int(getattr(self.cfg, "policy_scalar_dim", 12))
+        SCALAR_D     = int(getattr(self.cfg, "policy_scalar_dim", 8))
 
         spec = build_action_spec(
             keep_fracs=self.cfg.keep_fracs,

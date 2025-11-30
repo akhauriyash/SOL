@@ -138,7 +138,7 @@ pol_max_len  = int(getattr(cfg, "policy_max_len", max(1024, cfg.rollout_len + 8)
 lam = float(sd.get("global_step_state", {}).get("lambda_keep", 0.0))
 lamprune = float(sd.get("global_step_state", {}).get("lambda_prune", 0.0))
 lamquant = float(sd.get("global_step_state", {}).get("lambda_quant", 0.0))
-SCALAR_D = int(getattr(cfg, "policy_scalar_dim", 12))
+SCALAR_D = int(getattr(cfg, "policy_scalar_dim", 8))
 
 spec = build_action_spec(
     keep_fracs=cfg.keep_fracs,

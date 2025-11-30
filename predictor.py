@@ -110,11 +110,20 @@ class _TransformerBlock(nn.Module):
 class RecurrentActorCriticPolicy(nn.Module):
     """
     Recurrent actor-critic built as a tiny Transformer with its own KV cache and learned positions.
+
     Inputs per step t (all LM-derived tensors are .detach()'d by caller):
-      - h_{t-1}  : LM last hidden from previous token       [B, H_lm]
-      - e(x_t)   : embedding of current input token          [B, E_lm]
-      - scalars  : [frac_old_t, t/T, lambda_keep]            [B, S=3]
-      - a_{t-1}  : previous action id                        [B]
+      - h_{t-1}  : LM last hidden from previous token         [B, H_lm]
+      - e(x_t)   : embedding of current input token           [B, E_lm]
+      - scalars  : 8D vector with:
+            [0] t_frac            \in [0,1]
+            [1] eff_flag          \in {0,1}
+            [2] lambda_keep
+            [3] lambda_prune
+            [4] lambda_quant
+            [5] dev_keep          = mean_keep_prev   - C_tok
+            [6] dev_prune         = mean_prune_prev  - C_pru
+            [7] dev_qratio        = mean_qratio_prev - C_q
+      - a_{t-1}  : previous action id                          [B]
     """
     def __init__(
         self,
@@ -128,20 +137,30 @@ class RecurrentActorCriticPolicy(nn.Module):
         action_dim: int = 32,
         max_len: int = 4096,
         dropout: float = 0.0,
-        scalar_dim: int = 12,
+        scalar_dim: int = 8,
     ):
         super().__init__()
         self.n_actions = n_actions
         self.scalar_dim = scalar_dim
+        # We only *use* a subset of the scalar features internally:
+        #   [0] t_frac, [1] eff_flag, [5] dev_keep, [6] dev_prune, [7] dev_qratio
+        # Lambdas [2:5] are ignored here, so callers can keep passing the original 8D vector.
+        kept_scalar_idx = [i for i in (0, 1, 5, 6, 7) if i < scalar_dim]
+        self.register_buffer(
+            "scalar_keep_idx",
+            torch.tensor(kept_scalar_idx, dtype=torch.long),
+            persistent=False,
+        )
         self.start_action_id = n_actions  # reserve BOS action id
         self.action_emb = nn.Embedding(n_actions + 1, action_dim)  # +1 for BOS
-        in_dim = h_dim + e_dim + scalar_dim + action_dim  # S scalars
+        in_dim = h_dim + e_dim + scalar_dim + action_dim  # will be overwritten below if scalar_proj=True
         self.obs_proj = nn.Linear(in_dim, d_model)
         scalar_proj = True
         if scalar_proj:
             self.action_emb = nn.Embedding(n_actions + 1, action_dim)  # +1 for BOS
+            eff_scalar_dim = len(kept_scalar_idx)
             self.scalar_proj = nn.Sequential(
-                nn.Linear(scalar_dim, 64),
+                nn.Linear(eff_scalar_dim, 64),
                 nn.GELU(),
                 nn.LayerNorm(64),
             )
@@ -168,12 +187,12 @@ class RecurrentActorCriticPolicy(nn.Module):
         self,
         h_lm: torch.Tensor,         # [B,H_lm]   (detached)
         e_tok: torch.Tensor,        # [B,E_lm]   (detached)
-        scalars: torch.Tensor,      # [B,3]
+        scalars: torch.Tensor,      # [B, scalar_proj_dim] after projection
         prev_action: torch.LongTensor,  # [B]
         pos_idx: torch.LongTensor,      # [B]
     ) -> torch.Tensor:
         a_emb = self.action_emb(prev_action)               # [B, A_dim]
-        x = torch.cat([h_lm, e_tok, scalars, a_emb], -1)   # [B, H+E+3+A_dim]
+        x = torch.cat([h_lm, e_tok, scalars, a_emb], -1)   # [B, H+E+S_used+A_dim]
         x = self.obs_proj(x).unsqueeze(1)                  # [B,1,D]
         x = x + self.pos_emb(pos_idx).unsqueeze(1)         # add learned position
         return x
@@ -187,7 +206,22 @@ class RecurrentActorCriticPolicy(nn.Module):
         temperature: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, PolicyState]:
         B = h_lm.size(0)
-        x = self._form_step_inputs(h_lm, e_tok, self.scalar_proj(scalars), state.last_action, state.step_idx)
+        # Drop lambda_* dimensions inside the policy; keep only
+        # t_frac, eff_flag, dev_keep, dev_prune, dev_qratio.
+        if self.scalar_keep_idx is not None:
+            scalars_used = torch.index_select(
+                scalars, dim=-1, index=self.scalar_keep_idx.to(scalars.device)
+            )
+        else:
+            scalars_used = scalars
+        x = self._form_step_inputs(
+            h_lm,
+            e_tok,
+            self.scalar_proj(scalars_used),
+            state.last_action,
+            state.step_idx,
+        )
+        # x = self._form_step_inputs(h_lm, e_tok, self.scalar_proj(scalars), state.last_action, state.step_idx)
         past_k = state.past_k
         past_v = state.past_v
         new_k, new_v = [], []
@@ -211,52 +245,47 @@ class RecurrentActorCriticPolicy(nn.Module):
         self,
         h_seq: torch.Tensor,            # [T,B,H_lm]  detached
         e_seq: torch.Tensor,            # [T,B,E_lm]  detached
-        scalars_seq: torch.Tensor,      # [T,B,3]
+        scalars_seq: torch.Tensor,      # [T,B,scalar_dim]
         prev_actions_seq: torch.Tensor, # [T,B]  (a_{t-1} for each t)
-        tbptt_k: int = 0,
+        tbptt_k: int = 0,               # kept for API compatibility; ignored
         temperature: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Full-episode causal Transformer over the rollout.
+
+        We ignore tbptt_k here and simply run a standard decoder-style stack:
+        all T steps in one shot with a causal mask. This is easier to reason about
+        than chunked TBPTT and matches the mental model "one transformer per rollout".
+        """
         T, B, _ = h_seq.shape
         device = h_seq.device
         pos = self._positions(T, B, device)  # [T,B]
-        logits_out = []
-        values_out = []
+        # Same scalar subset as in step(): drop the lambda_* entries.
+        if self.scalar_keep_idx is not None:
+            scalars_used = torch.index_select(
+                scalars_seq, dim=-1, index=self.scalar_keep_idx.to(scalars_seq.device)
+            )
+        else:
+            scalars_used = scalars_seq
 
-        chunk = tbptt_k if tbptt_k and tbptt_k > 0 else T
-        start = 0
-        past_k = [None] * len(self.blocks)
-        past_v = [None] * len(self.blocks)
-        while start < T:
-            end = min(T, start + chunk)
-            x = torch.cat(
-                [
-                    h_seq[start:end],                             # [K,B,H]
-                    e_seq[start:end],                             # [K,B,E]
-                    self.scalar_proj(scalars_seq[start:end]),     # [K,B,64]
-                    self.action_emb(prev_actions_seq[start:end])  # [K,B,A_dim]
-                ],
-                dim=-1,
-            )                                                    # [K,B,H+E+3+A_dim]
-            x = self.obs_proj(x) + self.pos_emb(pos[start:end])  # [K,B,D]
-            x = x.transpose(0, 1).contiguous()                   # [B,K,D]
+        x = torch.cat(
+            [
+                h_seq,                               # [T,B,H_lm]
+                e_seq,                               # [T,B,E_lm]
+                self.scalar_proj(scalars_used),      # [T,B,scalar_proj_dim]
+                self.action_emb(prev_actions_seq),   # [T,B,A_dim]
+            ],
+            dim=-1,
+        )        
+        x = self.obs_proj(x) + self.pos_emb(pos)    # [T,B,D_model]
+        x = x.transpose(0, 1).contiguous()          # [B,T,D_model]
 
-            new_k, new_v = [], []
-            h = x
-            for li, block in enumerate(self.blocks):
-                h, pk, pv = block(h, past_k=past_k[li], past_v=past_v[li], use_cache=True)
-                new_k.append(pk); new_v.append(pv)
-            h = self.ln_f(h)                                     # [B,K,D]
-            logits = self.pi(h) / max(1e-6, temperature)         # [B,K,A]
-            value  = self.v(h).squeeze(-1)                       # [B,K]
+        h = x
+        for block in self.blocks:
+            h, _, _ = block(h, past_k=None, past_v=None, use_cache=False)
+        h = self.ln_f(h)                             # [B,T,D_model]
 
-            logits_out.append(logits.transpose(0, 1))            # [K,B,A]
-            values_out.append(value.transpose(0, 1))             # [K,B]
+        logits = self.pi(h) / max(1e-6, temperature) # [B,T,A]
+        values = self.v(h).squeeze(-1)               # [B,T]
 
-            # detach caches between chunks (TBPTT)
-            past_k = [k.detach() if k is not None else None for k in new_k]
-            past_v = [v.detach() if v is not None else None for v in new_v]
-            start = end
-
-        logits_all = torch.cat(logits_out, dim=0)                # [T,B,A]
-        values_all = torch.cat(values_out, dim=0)                # [T,B]
-        return logits_all, values_all
+        return logits.transpose(0, 1), values.transpose(0, 1)

@@ -129,7 +129,7 @@ def train_one_epoch_grpo(tok,
 
 
     # === Multi-constraint budgets (token keep, prune keep, quant bits) ===
-    C_tok   = float(getattr(cfg, "C_target_token", getattr(cfg, "C_target", getattr(cfg, "keep_target", 1.0))))
+    C_tok   = float(getattr(cfg, "C_target", getattr(cfg, "C_target_token", getattr(cfg, "keep_target", 1.0))))
     tol_tok = float(getattr(cfg, "tol_token", getattr(cfg, "budget_tolerance", getattr(cfg, "keep_tolerance", 0.01))))
     lr_tok  = float(getattr(cfg, "lambda_lr_token", getattr(cfg, "lambda_lr", 0.5)))
     init_tok= float(getattr(cfg, "lambda_init_token", getattr(cfg, "lambda_init", 25)))
@@ -147,11 +147,6 @@ def train_one_epoch_grpo(tok,
     if global_step_state is None:
         global_step_state = {"micro": 0, "update": 0}
 
-    # Initialize dual variables
-    global_step_state.setdefault("lambda_keep",  init_tok)
-    global_step_state.setdefault("lambda_prune", init_pru)
-    global_step_state.setdefault("lambda_quant", init_q)
-
     action_spec = build_action_spec(
         keep_fracs=cfg.keep_fracs,
         prune_choices=getattr(cfg, "struct_prune_choices", ("s100",)),
@@ -159,9 +154,24 @@ def train_one_epoch_grpo(tok,
     )
     A = action_spec.n_actions
     P_MAX = float(max(action_spec.prune_keep)) if len(action_spec.prune_keep) > 0 else 1.0
-
+    
+    has_keep_dof  = len(set(action_spec.token_keep)) > 1
     has_prune_dof = len(set(action_spec.prune_keep)) > 1
     has_quant_dof = len(set(action_spec.q_bits)) > 1
+    
+    # Initialize dual variables
+    if has_keep_dof:
+        global_step_state.setdefault("lambda_keep",  init_tok)
+    else:
+        global_step_state.setdefault("lambda_keep",  0.0)
+    if has_prune_dof:
+        global_step_state.setdefault("lambda_prune", init_pru)
+    else:
+        global_step_state.setdefault("lambda_prune", 0.0)
+    if has_quant_dof:
+        global_step_state.setdefault("lambda_quant", init_q)
+    else:
+        global_step_state.setdefault("lambda_quant", 0.0)
 
     KEEP_TOKEN = torch.tensor(action_spec.token_keep, device=device, dtype=torch.float32)
     KEEP_PRUNE = torch.tensor(action_spec.prune_keep, device=device, dtype=torch.float32)
@@ -303,13 +313,13 @@ def train_one_epoch_grpo(tok,
         keep_chosen_sum = torch.tensor(0.0, device=device)
         cost_eff_sum = torch.tensor(0.0, device=device)
         eff_tok = torch.tensor(0.0, device=device)
-
-        # Recurrent policy state (BK) & budget trackers
+        # Recurrent policy state (BK) & per-episode budget trackers
         pi_state = policy.init_state(Bk, device=device)
         prev_action_ids = pi_state.last_action.clone()
-        cum_keep = torch.zeros(Bk, device=device)
-        cum_eff  = torch.zeros(Bk, device=device)
-        phi_prev = torch.zeros(Bk, device=device)
+        cum_keep   = torch.zeros(Bk, device=device)  # sum_t eff_t * kappa_t
+        cum_eff    = torch.zeros(Bk, device=device)  # sum_t eff_t
+        cum_prune  = torch.zeros(Bk, device=device)  # sum_t eff_t * (prune_t / P_MAX)
+        cum_qratio = torch.zeros(Bk, device=device)  # sum_t eff_t * q_ratio_t
 
         for t in range(cfg.rollout_len):
             # Tile input token & label across K
@@ -319,40 +329,64 @@ def train_one_epoch_grpo(tok,
             eff_mask = (kv_len_pol > thr)                             # [BK]
             tok_embed = emb_layer(cur).detach()
 
-            win = float(cfg.Ts + cfg.Tw + 1)
-            fill_frac = min(t + 1, win) / win
-            frac_old = torch.full((Bk, 1), fill_frac, device=device, dtype=torch.float32)
-            t_frac = torch.full_like(frac_old, 2.0 * ((t + 1) / float(cfg.rollout_len)) - 1.0)
-            lambda_keep_now  = torch.full_like(frac_old, float(global_step_state["lambda_keep"]))
-            lambda_prune_now = torch.full_like(frac_old, float(global_step_state["lambda_prune"]))
-            lambda_quant_now = torch.full_like(frac_old, float(global_step_state["lambda_quant"]))
+            # --- Structured scalar features (8D) ---
+            # 0: t_frac            \in [0, 1]               (progress through rollout)
+            # 1: eff_flag          \in {0, 1}               (controllable vs warmup)
+            # 2: lambda_keep       \ge 0
+            # 3: lambda_prune      \ge 0 (0 if no prune DOF)
+            # 4: lambda_quant      \ge 0 (0 if no quant DOF)
+            # 5: dev_keep          = mean_keep_prev   - C_tok
+            # 6: dev_prune         = mean_prune_prev  - C_pru
+            # 7: dev_qratio        = mean_qratio_prev - C_q
+            t_frac = torch.full(
+                (Bk, 1),
+                (t + 1) / float(cfg.rollout_len),
+                device=device,
+                dtype=torch.float32,
+            )
+            eff_flag = eff_mask.float().unsqueeze(1)
 
-            mean_keep_prev = torch.where(cum_eff > 0, cum_keep / cum_eff, torch.zeros_like(cum_keep))
+            lambda_keep_now = torch.full_like(
+                t_frac,
+                float(global_step_state["lambda_keep"]),
+            )
+            lambda_prune_now = torch.full_like(
+                t_frac,
+                float(global_step_state["lambda_prune"] if has_prune_dof else 0.0),
+            )
+            lambda_quant_now = torch.full_like(
+                t_frac,
+                float(global_step_state["lambda_quant"] if has_quant_dof else 0.0),
+            )
 
-            dev_prev = mean_keep_prev - C_tok
-            if tol_tok > 0:
-                tol_t = torch.as_tensor(tol_tok, device=device, dtype=dev_prev.dtype)
-                dev_norm_prev = dev_prev / tol_t
-                gap_prev = (dev_prev.abs() - tol_t).clamp_min(0.0) / tol_t
-            else:
-                dev_norm_prev = dev_prev
-                gap_prev = (dev_prev.abs()).clamp_min(0.0)
+            # Running means up to *previous* step
+            mean_keep_prev = torch.where(
+                cum_eff > 0, cum_keep / cum_eff, torch.full_like(cum_keep, C_tok)
+            )
+            mean_prune_prev = torch.where(
+                cum_eff > 0, cum_prune / cum_eff, torch.full_like(cum_keep, C_pru)
+            )
+            mean_qratio_prev = torch.where(
+                cum_eff > 0, cum_qratio / cum_eff, torch.full_like(cum_keep, C_q)
+            )
 
-            eff_flag = eff_mask.float()
-            eff_count_norm = torch.where(cum_eff > 0, cum_eff / float(cfg.rollout_len), torch.zeros_like(cum_eff))
-            steps_rem_frac = torch.full_like(frac_old, (cfg.rollout_len - t) / float(cfg.rollout_len))
-            phi_prev_feat = phi_prev
+            dev_keep = mean_keep_prev - C_tok
+            dev_prune = mean_prune_prev - C_pru
+            dev_qratio = mean_qratio_prev - C_q
 
-            scalars = torch.cat([
-                frac_old, t_frac, lambda_keep_now, lambda_prune_now, lambda_quant_now,
-                eff_flag.unsqueeze(1),
-                mean_keep_prev.unsqueeze(1),
-                dev_norm_prev.unsqueeze(1),
-                gap_prev.unsqueeze(1),
-                steps_rem_frac,
-                eff_count_norm.unsqueeze(1),
-                phi_prev_feat.unsqueeze(1),
-            ], dim=-1)  # [BK, 12]
+            scalars = torch.cat(
+                [
+                    t_frac,
+                    eff_flag,
+                    lambda_keep_now,
+                    lambda_prune_now,
+                    lambda_quant_now,
+                    dev_keep.unsqueeze(1),
+                    dev_prune.unsqueeze(1),
+                    dev_qratio.unsqueeze(1),
+                ],
+                dim=-1,
+            )  # [BK, 8]
 
             h_prev_for_policy = state_pol.to(torch.float32)
             logits, _value_unused, pi_state = policy.step(
@@ -424,14 +458,17 @@ def train_one_epoch_grpo(tok,
             cost_t_eff   = eff * kappa_now                             # [BK]
             cost_delta_t = cost_t_eff - eff * C_tok                    # deviation from token target
             penalty_t    = float(global_step_state["lambda_keep"]) * cost_delta_t
-            cum_eff  = cum_eff  + eff
-            cum_keep = cum_keep + cost_t_eff
 
-            mean_keep_so_far = torch.where(cum_eff > 0, cum_keep / cum_eff, torch.zeros_like(cum_eff))
-            dev_abs = (mean_keep_so_far - C_tok).abs()
-            phi_now = (dev_abs - tol_tok).clamp_min(0.0)
-            phi_prev = phi_now.detach()
-            # h_seq_buf.append(state_pol.to(torch.float32))
+            # Episode-wise running sums (used for scalars on next step)
+            cum_eff    = cum_eff    + eff
+            cum_keep   = cum_keep   + cost_t_eff
+            cum_prune  = cum_prune  + eff * (prune_now / P_MAX)
+            cum_qratio = cum_qratio + eff * q_ratio
+
+            mean_keep_so_far = torch.where(
+                cum_eff > 0, cum_keep / cum_eff, torch.zeros_like(cum_eff)
+            )
+            # LM state for policy is the *previous* LM state (before taking this action)
             h_seq_buf.append(h_prev_for_policy)
             e_seq_buf.append(tok_embed.to(torch.float32))
             scalars_seq_buf.append(scalars)
@@ -523,9 +560,9 @@ def train_one_epoch_grpo(tok,
             else:
                 x_for_adv = returns
 
-        adv_r = _grpo_adv(x_for_adv, level=grpo_level)
-        if adv_whiten_global:
-            adv_r = (adv_r - adv_r.mean()) / adv_r.std(unbiased=False).clamp_min(1e-6)
+        # adv_r = _grpo_adv(x_for_adv, level=grpo_level)
+        # if adv_whiten_global:
+        #     adv_r = (adv_r - adv_r.mean()) / adv_r.std(unbiased=False).clamp_min(1e-6)
 
         sum_eff_seq    = eff_all.sum(dim=0).clamp_min(1.0)               # [BK]
         mean_keep_seq  = (eff_all * keep_all).sum(dim=0) / sum_eff_seq   # [BK]
@@ -553,14 +590,30 @@ def train_one_epoch_grpo(tok,
         lam_tok = float(global_step_state.get("lambda_keep",  0.0))
         lam_pru = float(global_step_state.get("lambda_prune", 0.0))
         lam_q   = float(global_step_state.get("lambda_quant", 0.0))
+        if not has_keep_dof:
+            lam_tok = 0.0
         if not has_prune_dof:
             lam_pru = 0.0
         if not has_quant_dof:
             lam_q = 0.0
-        adv = (adv_r
-               - alpha_c * lam_tok * d_tok.view(1, -1) * s_tok.view(1, -1) * dev_tok
-               - alpha_c * lam_pru * d_pru.view(1, -1) * s_pru.view(1, -1) * dev_pru
-               - alpha_c * lam_q   * d_q.view(1, -1)   * s_q.view(1, -1)   * dev_q)
+
+        # Per-step cost contributions, shaped like the task reward: [T, BK]
+        cost_tok = lam_tok * d_tok.view(1, -1) * s_tok.view(1, -1) * dev_tok
+        cost_pru = lam_pru * d_pru.view(1, -1) * s_pru.view(1, -1) * dev_pru
+        cost_q   = lam_q   * d_q.view(1, -1)   * s_q.view(1, -1)   * dev_q
+
+        # Total reward for GRPO: task minus weighted costs
+        computational_component = alpha_c * (cost_tok + cost_pru + cost_q)
+        r_total = x_for_adv - computational_component
+
+        # Compute advantage of the combined objective and (optionally) whiten it.
+        adv = _grpo_adv(r_total, level=grpo_level)
+        if adv_whiten_global:
+            adv = (adv - adv.mean()) / adv.std(unbiased=False).clamp_min(1e-6)
+        # adv = (adv_r
+        #        - alpha_c * lam_tok * d_tok.view(1, -1) * s_tok.view(1, -1) * dev_tok
+        #        - alpha_c * lam_pru * d_pru.view(1, -1) * s_pru.view(1, -1) * dev_pru
+        #        - alpha_c * lam_q   * d_q.view(1, -1)   * s_q.view(1, -1)   * dev_q)
 
         agg_h_seq.append(h_seq)
         agg_e_seq.append(e_seq)
@@ -816,12 +869,25 @@ def train_one_epoch_grpo(tok,
         abs_penalty = penalty_all.abs().mean().item()
         ratio_abs = (abs_penalty / max(abs_task, 1e-8)) if abs_task > 0 else float('inf')
         log_cost_eff = (cost_eff_sum / eff_tok.clamp_min(1.0)).item() if eff_tok.item() > 0 else float("nan")
+        mean_r_total = r_total.mean().item()
+        mean_x_for_adv = x_for_adv.mean().item()
+        mean_comp = computational_component.mean().item()
+
+        mean_abs_x_for_adv = x_for_adv.abs().mean().item()
+        mean_abs_comp = computational_component.abs().mean().item()
+        comp_over_task_abs = (
+            mean_abs_comp / max(mean_abs_x_for_adv, 1e-8)
+        ) if mean_abs_x_for_adv > 0 else float("inf")
+
+        mean_cost_tok = cost_tok.mean().item()
+        mean_cost_pru = cost_pru.mean().item()
+        mean_cost_q   = cost_q.mean().item()
 
         action_frac = {}
         denom = action_counts.sum().clamp_min(1.0)
         for i in range(A):
             tag = action_spec.tags[i]
-            action_frac[f"train/action_frac/{tag}"] = float((action_counts[i] / denom).item())
+            action_frac[f"action_fracs/action_frac/{tag}"] = float((action_counts[i] / denom).item())
         if run is not None:
             metrics = {
                 "train/avg_reward": mean_r,
@@ -837,6 +903,17 @@ def train_one_epoch_grpo(tok,
                 "train/lambda_quant": global_step_state["lambda_quant"],
                 "train/budget_gap_token": (log_cost_eff - C_tok) if not math.isnan(log_cost_eff) else float("nan"),
                 "train/ppl_approx": ppl_approx,
+                
+                "reward_comps/r_total_mean": mean_r_total,
+                "reward_comps/x_for_adv_mean": mean_x_for_adv,
+                "reward_comps/computational_component_mean": mean_comp,
+                "reward_comps/x_for_adv_abs_mean": mean_abs_x_for_adv,
+                "reward_comps/computational_component_abs_mean": mean_abs_comp,
+                "reward_comps/comp_vs_task_abs_ratio": comp_over_task_abs,
+                "reward_comps/cost_tok_mean": mean_cost_tok,
+                "reward_comps/cost_prune_mean": mean_cost_pru,
+                "reward_comps/cost_quant_mean": mean_cost_q,
+
                 "update_step": global_step_state["update"],
                 "micro_step": global_step_state["micro"],
             }
@@ -1024,7 +1101,8 @@ def train_one_epoch_sft(
         )  # [T, B, A]
 
         T, Bmb, _ = logits_seq.shape
-        eff_mask = (scalars_seq[..., 3] > 0.5).float()    # [T,B]
+        # eff_flag is scalar feature index 1: {0,1} for "controllable" steps
+        eff_mask = (scalars_seq[..., 1] > 0.5).float()    # [T,B]
 
         ce = F.cross_entropy(
             logits_seq.reshape(T * Bmb, A),
@@ -1087,7 +1165,7 @@ def train_one_epoch_sft(
         if run is not None:
             total_actions = action_counts.sum().clamp_min(1.0)
             action_frac = {
-                f"train/action_frac/k={float(cfg.keep_fracs[i]):.2f}": float((action_counts[i] / total_actions).item())
+                f"action_fracs/action_frac/k={float(cfg.keep_fracs[i]):.2f}": float((action_counts[i] / total_actions).item())
                 for i in range(A)
             }
             metrics = {
@@ -1293,7 +1371,10 @@ def main():
     if is_main:
         ckpt_dir = os.path.join("checkpoints", (run.name if run is not None else f"RL4E-SFT-{timestamp}"))
         os.makedirs(ckpt_dir, exist_ok=True)
-        snapshot_code(ckpt_dir, root_dir=os.getcwd(), skip_dirs=[".venv", ".git", "backup", "checkpoints", "__pycache__", "wandb", "block_cache"])
+        snapshot_code(ckpt_dir, root_dir=os.getcwd(), skip_dirs = [
+                ".venv", ".git", "__pycache__", "wandb", "checkpoints", "block_cache",
+                "official_configs", "official_results", "newckpt", "old_ch", "sol",
+            ])
         try:
             with open(os.path.join(ckpt_dir, "train_meta.json"), "w") as f:
                 json.dump(meta, f, indent=2)
@@ -1323,8 +1404,9 @@ def main():
     pol_mlp_mult = float(getattr(cfg, "policy_mlp_ratio", 4.0))
     pol_act_dim  = int(getattr(cfg, "policy_action_dim", 32))
     pol_max_len  = int(getattr(cfg, "policy_max_len", max(1024, cfg.rollout_len + 8)))
-    SCALAR_D = int(getattr(cfg, "policy_scalar_dim", 12))
-
+    # Number of scalar features provided to the policy per step.
+    # Must match the construction in train_one_epoch_grpo / teacher code.
+    SCALAR_D = int(getattr(cfg, "policy_scalar_dim", 8))
     spec = build_action_spec(
         keep_fracs=cfg.keep_fracs,
         prune_choices=cfg.struct_prune_choices,
@@ -1396,7 +1478,7 @@ def main():
         if distributed and isinstance(dl.sampler, DistributedSampler):
             dl.sampler.set_epoch(epoch)
 
-        TRAIN_FRACTION = 0.4
+        TRAIN_FRACTION = 0.2
         max_batches = max(1, int(len(dl) * TRAIN_FRACTION))
         dl_epoch = limited_dl(dl, max_batches)
 

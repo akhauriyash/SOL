@@ -28,10 +28,12 @@ import numpy as np
 
 @dataclass
 class PolicyRuntimeState:
-    cum_keep: torch.Tensor   # [B]
-    cum_eff: torch.Tensor    # [B]
-    phi_prev: torch.Tensor   # [B]
-    pi_state: any            # PolicyState
+    cum_keep: torch.Tensor    # [B]
+    cum_eff: torch.Tensor     # [B]
+    cum_prune: torch.Tensor   # [B]  (normalized prune keep)
+    cum_qratio: torch.Tensor  # [B]  (bits/16)
+    pi_state: any             # PolicyState
+
 
 def endswith_seq(seq_ids, suffix_ids):
     L = len(suffix_ids)
@@ -72,6 +74,7 @@ class FixedLMRunner:
         self.Ts = int(getattr(cfg, "Ts", 0))
         self.Tw = int(getattr(cfg, "Tw", 0))
         self.thr = self.Ts + self.Tw + 1
+        self.P_MAX = float(max(spec.prune_keep)) if len(spec.prune_keep) > 0 else 1.0
         self.criteria = str(getattr(cfg, "sparsity_criteria", "recency"))
         self.tier = str(getattr(cfg, "relevancy_tier", "per_head"))
 
@@ -618,7 +621,7 @@ class PolicyLMRunner:
 
         self.dense_idx = int(spec.dense_idx)
         enable_structured_controls(self.m)
-        self._scalar_dim = int(getattr(self.pol, "scalar_dim", 12))
+        self._scalar_dim = int(getattr(self.pol, "scalar_dim", 8))
         self.sparsity_bias = float(sparsity_bias)
         self.prune_bias    = float(prune_bias)
         self.quant_bias    = float(quant_bias)
@@ -653,12 +656,13 @@ class PolicyLMRunner:
         self.dense_refresh_tail = int(dense_refresh_tail) if dense_refresh_tail is not None else int(self.thr)
 
         self.C_target = float(getattr(cfg, "C_target", getattr(cfg, "keep_target", 1.0)))
-        self.tol = float(getattr(cfg, "budget_tolerance", getattr(cfg, "keep_tolerance", 0.1)))
-        self.budget_penalty = str(getattr(cfg, "budget_penalty", "linear"))
+        self.C_prune  = float(getattr(cfg, "C_target_prune", 0.70))
+        self.C_qbits  = float(getattr(cfg, "C_target_quant_bits", 8.0))
+        self.C_qratio = self.C_qbits / 16.0
         self.criteria = str(getattr(cfg, "sparsity_criteria", "recency"))
         self.tier = str(getattr(cfg, "relevancy_tier", "per_head"))
         self.emb_layer = unwrap(self.m).get_input_embeddings()
-        self._scalar_dim = int(getattr(self.pol, "scalar_dim", getattr(self.cfg, "policy_scalar_dim", 12)))
+        self._scalar_dim = int(getattr(self.pol, "scalar_dim", getattr(self.cfg, "policy_scalar_dim", 8)))
  
 
     @torch.inference_mode()
@@ -682,65 +686,68 @@ class PolicyLMRunner:
         return PolicyRuntimeState(
             cum_keep=zero.clone(),
             cum_eff=zero.clone(),
-            phi_prev=zero.clone(),
+            cum_prune=zero.clone(),
+            cum_qratio=zero.clone(),
             pi_state=pi_state,
         )
 
     def _build_scalars(self, t_in_episode: int, kv_len: torch.Tensor, rt: PolicyRuntimeState, steps_seen: int, total_steps_target: int):
-        win = float(self.Ts + self.Tw + 1)
-        frac_old = torch.full((1,1), min(float(t_in_episode), win) / win, device=self.device, dtype=torch.float32)
-        t_frac   = torch.full_like(frac_old, 2.0 * (float(t_in_episode) / float(self.episode_len)) - 1.0)
-        lam_keep  = torch.full_like(frac_old, self.lambda_keep)
-        lam_prune = torch.full_like(frac_old, self.lambda_prune)
-        lam_quant = torch.full_like(frac_old, self.lambda_quant)
+        B = kv_len.shape[0]
 
+        # 8-D scalar layout:
+        #   [0] t_frac       in [0,1]
+        #   [1] eff_flag     in {0,1}
+        #   [2] lambda_keep
+        #   [3] lambda_prune
+        #   [4] lambda_quant
+        #   [5] dev_keep     = mean_keep_prev   - C_target
+        #   [6] dev_prune    = mean_prune_prev  - C_prune
+        #   [7] dev_qratio   = mean_qratio_prev - C_qratio
+        t_frac = torch.full(
+            (B, 1),
+            (t_in_episode + 1) / float(self.episode_len),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        eff_flag = (kv_len > self.thr).float().view(B, 1)
 
-        eff_mask = (kv_len > self.thr).float().view(1,1)
-        mean_keep_prev = torch.where(rt.cum_eff > 0, rt.cum_keep / rt.cum_eff, torch.zeros_like(rt.cum_keep))
-        dev_prev = mean_keep_prev - self.C_target
-        dev_norm_prev = (dev_prev / self.tol) if self.tol > 0 else dev_prev
-        gap_prev = (dev_prev.abs() - self.tol).clamp_min(0.0)
-        if self.tol > 0:
-            gap_prev = gap_prev / self.tol
+        lam_keep = torch.full_like(t_frac, self.lambda_keep)
+        lam_prune = torch.full_like(t_frac, self.lambda_prune)
+        lam_quant = torch.full_like(t_frac, self.lambda_quant)
 
-        steps_rem_frac = torch.full_like(frac_old, max(0, self.episode_len - t_in_episode) / float(self.episode_len))
-        eff_count_norm = torch.where(rt.cum_eff > 0, rt.cum_eff / float(self.episode_len), torch.zeros_like(rt.cum_eff))
+        mean_keep_prev = torch.where(
+            rt.cum_eff > 0,
+            rt.cum_keep / rt.cum_eff,
+            torch.full_like(rt.cum_keep, self.C_target),
+        )
+        mean_prune_prev = torch.where(
+            rt.cum_eff > 0,
+            rt.cum_prune / rt.cum_eff,
+            torch.full_like(rt.cum_prune, self.C_prune),
+        )
+        mean_qratio_prev = torch.where(
+            rt.cum_eff > 0,
+            rt.cum_qratio / rt.cum_eff,
+            torch.full_like(rt.cum_qratio, self.C_qratio),
+        )
 
-        if self._scalar_dim >= 12:
-            scalars = torch.cat(
-                [
-                    frac_old,
-                    t_frac,
-                    lam_keep,
-                    lam_prune,
-                    lam_quant,
-                    eff_mask,
-                    mean_keep_prev.view(1,1),
-                    dev_norm_prev.view(1,1),
-                    gap_prev.view(1,1),
-                    steps_rem_frac,
-                    eff_count_norm.view(1,1),
-                    rt.phi_prev.view(1,1),
-                ],
-                dim=-1,
-            )
-        else:
-            lam = lam_keep
-            scalars = torch.cat(
-                [
-                    frac_old,
-                    t_frac,
-                    lam,
-                    eff_mask,
-                    mean_keep_prev.view(1,1),
-                    dev_norm_prev.view(1,1),
-                    gap_prev.view(1,1),
-                    steps_rem_frac,
-                    eff_count_norm.view(1,1),
-                    rt.phi_prev.view(1,1),
-                ],
-                dim=-1,
-            )
+        dev_keep = mean_keep_prev - self.C_target
+        dev_prune = mean_prune_prev - self.C_prune
+        dev_qratio = mean_qratio_prev - self.C_qratio
+
+        scalars = torch.cat(
+            [
+                t_frac,
+                eff_flag,
+                lam_keep,
+                lam_prune,
+                lam_quant,
+                dev_keep.view(B, 1),
+                dev_prune.view(B, 1),
+                dev_qratio.view(B, 1),
+            ],
+            dim=-1,
+        )
         return scalars.to(torch.float32)
 
     @torch.inference_mode()
@@ -900,14 +907,12 @@ class PolicyLMRunner:
         if greedy_tok0 != labels0:
             is_greedy_all = False
         running.append(labels0)
-        # Budget tracking after step 0
+        # Budget tracking after step 0 (for future scalar features)
         eff0 = eff_mask.float()
-        rt.cum_eff = rt.cum_eff + eff0
-        rt.cum_keep = rt.cum_keep + eff0 * kappa_now
-        mean_keep0 = torch.where(rt.cum_eff > 0, rt.cum_keep / rt.cum_eff, torch.zeros_like(rt.cum_eff))
-        dev_abs0 = (mean_keep0 - self.C_target).abs()
-        phi0 = (dev_abs0 - self.tol).clamp_min(0.0) if self.budget_penalty == "linear" else (dev_abs0 - self.tol).clamp_min(0.0) ** 2
-        rt.phi_prev = phi0.detach()
+        rt.cum_eff    = rt.cum_eff    + eff0
+        rt.cum_keep   = rt.cum_keep   + eff0 * kappa_now
+        rt.cum_prune  = rt.cum_prune  + eff0 * (prune_now.to(torch.float32) / self.P_MAX)
+        rt.cum_qratio = rt.cum_qratio + eff0 * qratio_now
         steps_in_episode += 1
         if steps_in_episode >= self.episode_len:
             steps_in_episode = 0
@@ -1070,15 +1075,10 @@ class PolicyLMRunner:
                 is_greedy_all = False
             running.append(labels_next)
             eff = eff_mask.float()
-            rt.cum_eff = rt.cum_eff + eff
-            rt.cum_keep = rt.cum_keep + eff * kappa_now
-            mean_keep = torch.where(rt.cum_eff > 0, rt.cum_keep / rt.cum_eff, torch.zeros_like(rt.cum_eff))
-            dev_abs = (mean_keep - self.C_target).abs()
-            if self.budget_penalty == "linear":
-                phi_now = (dev_abs - self.tol).clamp_min(0.0)
-            else:
-                phi_now = (dev_abs - self.tol).clamp_min(0.0) ** 2
-            rt.phi_prev = phi_now.detach()
+            rt.cum_eff    = rt.cum_eff    + eff
+            rt.cum_keep   = rt.cum_keep   + eff * kappa_now
+            rt.cum_prune  = rt.cum_prune  + eff * (prune_now.to(torch.float32) / self.P_MAX)
+            rt.cum_qratio = rt.cum_qratio + eff * qratio_now
 
             steps_in_episode += 1
             if steps_in_episode >= self.episode_len:
@@ -1352,16 +1352,12 @@ class PolicyLMRunner:
                 del running[-trim:]
                 break
 
+
             eff = eff_mask.float()
-            rt.cum_eff = rt.cum_eff + eff
-            rt.cum_keep = rt.cum_keep + eff * kappa_now
-            mean_keep = torch.where(rt.cum_eff > 0, rt.cum_keep / rt.cum_eff, torch.zeros_like(rt.cum_eff))
-            dev_abs = (mean_keep - self.C_target).abs()
-            if self.budget_penalty == "linear":
-                phi_now = (dev_abs - self.tol).clamp_min(0.0)
-            else:
-                phi_now = (dev_abs - self.tol).clamp_min(0.0) ** 2
-            rt.phi_prev = phi_now.detach()
+            rt.cum_eff    = rt.cum_eff    + eff
+            rt.cum_keep   = rt.cum_keep   + eff * kappa_now
+            rt.cum_prune  = rt.cum_prune  + eff * (prune_now.to(torch.float32) / self.P_MAX)
+            rt.cum_qratio = rt.cum_qratio + eff * qratio_now
 
             steps_in_episode += 1
             if steps_in_episode >= self.episode_len:

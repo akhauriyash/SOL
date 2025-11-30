@@ -75,32 +75,10 @@ def evaluate_stateful_policy_rollout(
 
     Differences vs the stateless evaluator:
       - Uses policy.init_state(B, device) and policy.step(..., state).
-      - **Feeds the same scalar feature set as training** (extended):
-          h_{t-1} (LM last hidden, detached),
-          e(x_t)  (current token embedding, detached),
-
-          scalars = [
-            frac_old_t,
-            t/T in [-1,1],
-            lambda_keep, lambda_prune, lambda_quant,
-            eff_flag,
-            mean_keep_prev, dev_norm_prev, gap_prev,
-            steps_rem_frac, eff_count_norm, phi_prev
-          ],  # 12 scalars total
-          prev action (carried inside policy state).
+      - Feeds the same 8D scalar vector as training:
+            [t_frac, eff_flag, lambda_keep, lambda_prune, lambda_quant,
+             dev_keep, dev_prune, dev_qratio]
       - Keeps LM frozen; all LM-derived features are detached.
-
-    Returns
-    -------
-    dict with:
-        ppl, avg_keep_all, avg_keep_effective,
-        action_hist, action_probs, tokens, tokens_effective
-
-    Optional knobs:
-        sparsity_bias: positive -> favors lower token keep (more sparse), negative -> favors denser.
-        prune_bias:    positive -> favors lower prune_keep (more structured pruning), negative -> favors s100.
-        quant_bias:    positive -> favors lower bits (heavier quant), negative -> favors higher bits.
-        (All are additive logit penalties; magnitude is in “logit units”.)
     """
     model.eval()
 
@@ -127,14 +105,18 @@ def evaluate_stateful_policy_rollout(
 
     P = len(spec.prune_keep)
     Q = len(spec.q_bits)
+    P_MAX = float(max(spec.prune_keep)) if len(spec.prune_keep) > 0 else 1.0
 
     thr = Ts + Tw + 1
     # Match training precedence for targets/tolerances
     C_tok   = float(getattr(cfg, "C_target_token", getattr(cfg, "C_target", getattr(cfg, "keep_target", 1.0))))
     tol_tok = float(getattr(cfg, "tol_token", getattr(cfg, "budget_tolerance", getattr(cfg, "keep_tolerance", 0.01))))
-    budget_penalty = str(getattr(cfg, "budget_penalty", "linear"))  # only used to compute phi_prev feature (for policy input)
-
-
+    C_pru   = float(getattr(cfg, "C_target_prune", 0.70))
+    tol_pru = float(getattr(cfg, "tol_prune", 0.05))
+    C_qbits = float(getattr(cfg, "C_target_quant_bits", 8.0))
+    C_q     = C_qbits / 16.0
+    tol_q   = float(getattr(cfg, "tol_quant_bits", 1.0)) / 16.0
+ 
     # index for "dense" κ to force on non-effective steps (matches teacher)
     # dense_idx = keep_fracs.index(1.0) if 1.0 in keep_fracs else int(torch.argmax(KEEP).item())
     dense_idx = int(spec.dense_idx)
@@ -203,53 +185,72 @@ def evaluate_stateful_policy_rollout(
 
         # Initialize recurrent policy state (policy-local time starts at 0; prev_action = BOS)
         pi_state = pol.init_state(B, device=device)
-        cum_keep = torch.zeros(B, device=device)   # sum of κ over effective tokens so far
-        cum_eff  = torch.zeros(B, device=device)   # count of effective tokens so far
-        phi_prev = torch.zeros(B, device=device)   # potential at previous step (used as scalar feature)
-
-
+        # Per‑sequence running stats over effective tokens
+        cum_keep   = torch.zeros(B, device=device)   # sum_t eff_t * kappa_t
+        cum_eff    = torch.zeros(B, device=device)   # sum_t eff_t
+        cum_prune  = torch.zeros(B, device=device)   # sum_t eff_t * (prune_t / P_MAX)
+        cum_qratio = torch.zeros(B, device=device)   # sum_t eff_t * qratio_t
         for t in range(rollout_len):
             cur = step_inputs[:, t]
             labels_t = step_labels[:, t]
             # Scalars & features (all LM-derived tensors are detached)
             eff_mask = (kv_len > thr)                                        # [B] bool
             tok_embed = emb_layer(cur).detach()                              # [B, E]
-            # Match training: use (t+1) for both fill and progress.
-            fill_frac = min(t + 1.0, win) / win
-            frac_old = torch.full((B, 1), fill_frac, device=device, dtype=torch.float32)  # [B,1]
-            t_frac = torch.full_like(frac_old, 2.0 * ((t + 1.0) / float(rollout_len)) - 1.0)  # [B,1]
-            lam_keep  = torch.full_like(frac_old, float(lambda_keep))   # [B,1]
-            lam_prune = torch.full_like(frac_old, float(lambda_prune))  # [B,1]
-            lam_quant = torch.full_like(frac_old, float(lambda_quant))  # [B,1]
-            mean_keep_prev = torch.where(cum_eff > 0, cum_keep / cum_eff, torch.zeros_like(cum_eff))  # [B]
 
-            dev_prev = mean_keep_prev - C_tok                                  # signed deviation
-            if tol_tok > 0:
-                tol_t = torch.as_tensor(tol_tok, device=device, dtype=dev_prev.dtype)
-                dev_norm_prev = dev_prev / tol_t
-                gap_prev = (dev_prev.abs() - tol_t).clamp_min(0.0) / tol_t
-            else:
-                dev_norm_prev = dev_prev
-                gap_prev = (dev_prev.abs()).clamp_min(0.0)
-            eff_flag = eff_mask.float()                                           # [B]
-            eff_count_norm = torch.where(cum_eff > 0, cum_eff / float(rollout_len), torch.zeros_like(cum_eff))
-            steps_rem_frac = torch.full_like(frac_old, (rollout_len - t) / float(rollout_len))
-            phi_prev_feat = phi_prev                                             # previous potential as a feature
+            # === 8D scalar feature vector (must match training) ===
+            # 0: t_frac        in [0,1]
+            # 1: eff_flag      in {0,1}
+            # 2: lambda_keep
+            # 3: lambda_prune
+            # 4: lambda_quant
+            # 5: dev_keep      = mean_keep_prev   - C_tok
+            # 6: dev_prune     = mean_prune_prev  - C_pru
+            # 7: dev_qratio    = mean_qratio_prev - C_q
+            t_frac = torch.full(
+                (B, 1),
+                (t + 1) / float(rollout_len),
+                device=device,
+                dtype=torch.float32,
+            )
+            eff_flag = eff_mask.float().unsqueeze(1)
 
-            scalars = torch.cat([
-                frac_old,                               # 1
-                t_frac,                                 # 1
-                lam_keep,                               # 1
-                lam_prune,                              # 1
-                lam_quant,                              # 1
-                eff_flag.unsqueeze(1),                  # 1
-                mean_keep_prev.unsqueeze(1),            # 1
-                dev_norm_prev.unsqueeze(1),             # 1
-                gap_prev.unsqueeze(1),                  # 1
-                steps_rem_frac,                         # 1
-                eff_count_norm.unsqueeze(1),            # 1
-                phi_prev_feat.unsqueeze(1),             # 1
-            ], dim=-1).to(torch.float32)  # [B, 12] (must match policy scalar_dim)
+            lambda_keep_now  = torch.full_like(t_frac, float(lambda_keep))
+            lambda_prune_now = torch.full_like(t_frac, float(lambda_prune))
+            lambda_quant_now = torch.full_like(t_frac, float(lambda_quant))
+
+            mean_keep_prev = torch.where(
+                cum_eff > 0,
+                cum_keep / cum_eff,
+                torch.full_like(cum_keep, C_tok),
+            )
+            mean_prune_prev = torch.where(
+                cum_eff > 0,
+                cum_prune / cum_eff,
+                torch.full_like(cum_prune, C_pru),
+            )
+            mean_qratio_prev = torch.where(
+                cum_eff > 0,
+                cum_qratio / cum_eff,
+                torch.full_like(cum_qratio, C_q),
+            )
+
+            dev_keep   = mean_keep_prev   - C_tok
+            dev_prune  = mean_prune_prev  - C_pru
+            dev_qratio = mean_qratio_prev - C_q
+
+            scalars = torch.cat(
+                [
+                    t_frac,
+                    eff_flag,
+                    lambda_keep_now,
+                    lambda_prune_now,
+                    lambda_quant_now,
+                    dev_keep.unsqueeze(1),
+                    dev_prune.unsqueeze(1),
+                    dev_qratio.unsqueeze(1),
+                ],
+                dim=-1,
+            ).to(torch.float32)  # [B, 8]
             # One recurrent policy step
             logits, _, pi_state_next = pol.step(
                 h_lm=state_lm.to(torch.float32),
@@ -374,17 +375,17 @@ def evaluate_stateful_policy_rollout(
 
             # === Update running budget state AFTER applying action (for next step's features) ===
             eff = has_old  # [B]
-            cum_eff_next  = cum_eff + eff
-            cum_keep_next = cum_keep + eff * kappa_now
-            mean_keep_so_far = torch.where(cum_eff_next > 0, cum_keep_next / cum_eff_next, torch.zeros_like(cum_eff_next))
-            dev_abs = (mean_keep_so_far - C_tok).abs()
-            if budget_penalty == "linear":
-                phi_now = (dev_abs - tol_tok).clamp_min(0.0)
-            else:
-                phi_now = (dev_abs - tol_tok).clamp_min(0.0) ** 2
-            phi_prev = phi_now
-            cum_eff, cum_keep = cum_eff_next, cum_keep_next
+            cum_eff_next    = cum_eff + eff
+            cum_keep_next   = cum_keep + eff * kappa_now
+            cum_prune_next  = cum_prune + eff * (prune_now / P_MAX)
+            cum_qratio_next = cum_qratio + eff * qratio_now
 
+            cum_eff, cum_keep, cum_prune, cum_qratio = (
+                cum_eff_next,
+                cum_keep_next,
+                cum_prune_next,
+                cum_qratio_next,
+            )
     ppl = math.exp(total_nll / max(1, total_tok))
     avg_keep_all = total_keep_all / max(1, total_tok)
     avg_keep_eff = (total_keep_eff / max(1, eff_tok)) if eff_tok > 0 else 0.0
@@ -525,6 +526,7 @@ def evaluate_sft_teacher_matched_keep(
         # Buffers for optional outputs
         teacher_actions_seq_buf = []  # [T,B]
         margins_seq_buf = []          # we'll log "score margin" (2nd best - best)
+
         if collect_policy_tensors:
             if initial_prev_action is None:
                 prev_action_ids = torch.full((B,), dense_idx, device=device, dtype=torch.long)
@@ -533,11 +535,6 @@ def evaluate_sft_teacher_matched_keep(
 
             h_seq_buf, e_seq_buf, scalars_seq_buf, prev_actions_seq_buf = [], [], [], []
             soft_seq_buf = []
-
-            # penalty feature bookkeeping
-            phi_prev = torch.zeros(B, device=device)
-            win = float(Ts + Tw + 1)
-
         for t in range(rollout_len):
             cur = step_inputs[:, t]          # [B]
             labels_t = step_labels[:, t]     # [B]
@@ -548,51 +545,53 @@ def evaluate_sft_teacher_matched_keep(
             has_old = eff_mask.float()
 
             # =======================
-            # PRE-DECISION FEATURES (policy-view)
+            # PRE-DECISION FEATURES (policy-view, 8D scalars)
             # =======================
             if collect_policy_tensors:
                 tok_embed = emb_layer(cur).detach().to(torch.float32)  # [B,E]
 
-                fill_frac = min(float(t), win) / win
-                frac_old = torch.full((B, 1), fill_frac, device=device, dtype=torch.float32)
-                t_frac = torch.full_like(frac_old, 2.0 * (float(t) / float(rollout_len)) - 1.0)
-                lambda_keep_now = torch.full_like(frac_old, float(lambda_keep_value))
+                # Same scalar schema as GRPO:
+                # [t_frac, eff_flag, lambda_keep, lambda_prune, lambda_quant,
+                #  dev_keep, dev_prune, dev_qratio]
+                t_frac = torch.full(
+                    (B, 1),
+                    (t + 1) / float(rollout_len),
+                    device=device,
+                    dtype=torch.float32,
+                )
                 eff_flag = has_old.unsqueeze(1)
 
-                mean_keep_so_far_pre = torch.where(
-                    cum_eff > 0, cum_keep / cum_eff, torch.zeros_like(cum_eff)
-                )
-                dev_abs_pre = (mean_keep_so_far_pre - target_keep_effective).abs()
-                if penalty_mode == "linear":
-                    phi_pre = (dev_abs_pre - tol).clamp_min(0.0)
-                else:
-                    phi_pre = (dev_abs_pre - tol).clamp_min(0.0) ** 2
+                lambda_keep_now  = torch.full_like(t_frac, float(lambda_keep_value))
+                lambda_prune_now = torch.zeros_like(t_frac)  # no structured pruning in this teacher
+                lambda_quant_now = torch.zeros_like(t_frac)  # no quantization in this teacher
 
-                steps_rem_frac = torch.full_like(frac_old, (rollout_len - t) / float(rollout_len))
-                eff_count_norm = torch.where(
-                    cum_eff > 0, cum_eff / float(rollout_len), torch.zeros_like(cum_eff)
+                mean_keep_prev = torch.where(
+                    cum_eff > 0,
+                    cum_keep / cum_eff,
+                    torch.full_like(cum_keep, target_keep_effective),
                 )
+                dev_keep   = mean_keep_prev - target_keep_effective
+                dev_prune  = torch.zeros_like(dev_keep)
+                dev_qratio = torch.zeros_like(dev_keep)
 
-                scalars = torch.cat([
-                    frac_old,                                       # 1
-                    t_frac,                                         # 2
-                    lambda_keep_now,                                # 3
-                    eff_flag,                                       # 4
-                    mean_keep_so_far_pre.unsqueeze(1),              # 5
-                    (((mean_keep_so_far_pre - target_keep_effective) / tol) if tol > 0
-                     else (mean_keep_so_far_pre - target_keep_effective)).unsqueeze(1),  # 6
-                    ((((dev_abs_pre - tol).clamp_min(0.0)) / tol) if tol > 0
-                     else dev_abs_pre.clamp_min(0.0)).unsqueeze(1),                      # 7
-                    steps_rem_frac,                                 # 8
-                    eff_count_norm.unsqueeze(1),                    # 9
-                    phi_prev.unsqueeze(1),                          # 10
-                ], dim=-1).to(torch.float32)
+                scalars = torch.cat(
+                    [
+                        t_frac,
+                        eff_flag,
+                        lambda_keep_now,
+                        lambda_prune_now,
+                        lambda_quant_now,
+                        dev_keep.unsqueeze(1),
+                        dev_prune.unsqueeze(1),
+                        dev_qratio.unsqueeze(1),
+                    ],
+                    dim=-1,
+                ).to(torch.float32)
 
                 h_seq_buf.append(last_h)
                 e_seq_buf.append(tok_embed)
                 scalars_seq_buf.append(scalars)
                 prev_actions_seq_buf.append(prev_action_ids)
-
             # =======================
             # PER-SEQUENCE DECISION
             # =======================
@@ -709,17 +708,7 @@ def evaluate_sft_teacher_matched_keep(
                 teacher_actions_seq_buf.append(a_star.detach())
 
             if collect_policy_tensors:
-                mean_keep_so_far_post = torch.where(
-                    cum_eff > 0, cum_keep / cum_eff, torch.zeros_like(cum_eff)
-                )
-                dev_abs_post = (mean_keep_so_far_post - target_keep_effective).abs()
-                if penalty_mode == "linear":
-                    phi_prev = (dev_abs_post - tol).clamp_min(0.0)
-                else:
-                    phi_prev = (dev_abs_post - tol).clamp_min(0.0) ** 2
-
                 prev_action_ids = a_star.detach()
-
         if return_assignments:
             teacher_actions_seq = torch.stack(teacher_actions_seq_buf, dim=0)  # [T,B]
             assignments_batches.append(teacher_actions_seq)

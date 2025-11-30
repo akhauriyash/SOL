@@ -52,5 +52,5 @@ perplexity 10.021
 
 A good overall optimization profile, seems to be 
 Pruning down to 0.65;                   with targets s30 to s100
-Quantization down to 6 bits (0.375)     with targets q6 to q16
+Quantization down to 6.5 bits (0.375)     with targets q6 to q16
 Token Sparsity down to 0.4              with targets t20 to t100          

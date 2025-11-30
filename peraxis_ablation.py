@@ -143,7 +143,7 @@ pol_layers   = int(getattr(cfg, "policy_n_layers", 2))
 pol_mlp_mult = float(getattr(cfg, "policy_mlp_ratio", 4.0))
 pol_act_dim  = int(getattr(cfg, "policy_action_dim", 32))
 pol_max_len  = int(getattr(cfg, "policy_max_len", max(1024, cfg.rollout_len + 8)))
-SCALAR_D     = int(getattr(cfg, "policy_scalar_dim", 12))
+SCALAR_D     = int(getattr(cfg, "policy_scalar_dim", 8))
 
 spec = build_action_spec(
     keep_fracs=cfg.keep_fracs,
