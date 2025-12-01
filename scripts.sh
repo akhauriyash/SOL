@@ -1,24 +1,34 @@
 
 ### New Longer Runs
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port 29510 train.py   \
-  --wandb_project SOLv3     --wandb_run_name v2RL_LCE_Q8_PQ    \
-   --config /mnt/home/ya255/projects/SOL/official_configs/v2RL_LCE_Q8_PQ.yml
-
 
 CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port 29512 train.py   \
   --wandb_project SOLv3     --wandb_run_name v3RL_LCE_Quant    \
    --config /mnt/home/ya255/projects/SOL/official_configs/v2RL_LCE_Quant.yml
 
 
-CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node=1 --master_port 29512 train.py   \
+CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node=1 --master_port 29513 train.py   \
   --wandb_project SOLv3     --wandb_run_name v3RL_LCE_Prune    \
    --config /mnt/home/ya255/projects/SOL/official_configs/v2RL_LCE_Prune.yml
 
+   
+CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port 29512 train.py   \
+  --wandb_project SOLv4     --wandb_run_name v3RL_LCE_Quant60pc    \
+   --config /mnt/home/ya255/projects/SOL/official_configs/v2RL_LCE_Quant60pc.yml
 
 
-CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node=1 --master_port 29522 train.py   \
+CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node=1 --master_port 29513 train.py   \
+  --wandb_project SOLv4     --wandb_run_name v3RL_LCE_Prune45pc    \
+   --config /mnt/home/ya255/projects/SOL/official_configs/v2RL_LCE_Prune45pc.yml
+
+
+
+CUDA_VISIBLE_DEVICES=2 torchrun --nproc_per_node=1 --master_port 29522 train.py   \
   --wandb_project SOLv3     --wandb_run_name v2RL_LCE_SparseQ4    \
    --config /mnt/home/ya255/projects/SOL/official_configs/v2RL_LCE_SparseQ4.yml
+
+CUDA_VISIBLE_DEVICES=3 torchrun --nproc_per_node=1 --master_port 29510 train.py   \
+  --wandb_project SOLv3     --wandb_run_name v2RL_LCE_Q8_PQ    \
+   --config /mnt/home/ya255/projects/SOL/official_configs/v2RL_LCE_Q8_PQ.yml
 
 
 
