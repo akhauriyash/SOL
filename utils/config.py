@@ -50,24 +50,24 @@ class Config:
     adv_whiten_global: bool = True
     kl_pi_ref_coef: float = 0.0  # turn on if you want π vs π_ref regularization
     reward_gamma: float = 0.82
-    tol_token: float = 0.01
-    tol_prune: float = 0.05
-    tol_quant_bits: float = 1.0
-    keep_tolerance: float = 0.01
-    budget_tolerance: float = 0.1
-    budget_penalty: str = "linear"
-    budget_steer_beta: float = 0.5
-    steer_beta: float = 0.5
     margin_soft_tau: float = 0.5
     score_soft_tau: float = 0.5
 
-    lambda_lr_token: float = 0.5
-    lambda_lr_prune: float = 0.5
-    lambda_lr_quant: float = 0.5
+    # --- Multi-budget GRPO (no Lagrangian) ---
+    # Per-rollout budgets will be sampled from these sets (normalized 0–1 ranges).
+    budget_tok_list: Tuple[float, ...] = (0.25, 0.5, 0.75)
+    budget_prune_list: Tuple[float, ...] = (0.3, 0.5, 0.7, 0.9)
+    budget_q_ratio_list: Tuple[float, ...] = (0.25, 0.5, 0.75)  # qratio = bits / 16
+    eval_C_tok: Optional[float] = None
+    eval_C_pru: Optional[float] = None
+    eval_C_qbits: Optional[float] = None
 
-    lambda_init_token: float = 25.0
-    lambda_init_prune: float = 25.0
-    lambda_init_quant: float = 25.0
+    # Fixed trade-off weights between accuracy (delta CE) and compute costs.
+    alpha_tok: float = 1.0
+    alpha_prune: float = 1.0
+    alpha_quant: float = 1.0
+
+
     # --- Sparse attention controls used by train_one_epoch_ppo ---
     Ts: int = 4                      # number of "sinks"
     Tw: int = 1                      # trailing dense window
@@ -107,11 +107,6 @@ class Config:
     gamma: float = 0.95
     gae_lambda: float = 0.9
     pi_temperature: float = 0.7
-    lambda_lr: float = 1e-2
-    lambda_init: float = 0.0
-    lambda_max: float = 20000.0
-    lambda_ema_beta: float = 0.9
-    cost_tradeoff_alpha: float = 1.0
 
     # --- Recurrent policy network hyperparams ---
     policy_d_model: int = 768

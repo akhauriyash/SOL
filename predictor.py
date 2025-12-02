@@ -117,12 +117,12 @@ class RecurrentActorCriticPolicy(nn.Module):
       - scalars  : 8D vector with:
             [0] t_frac            \in [0,1]
             [1] eff_flag          \in {0,1}
-            [2] lambda_keep
-            [3] lambda_prune
-            [4] lambda_quant
-            [5] dev_keep          = mean_keep_prev   - C_tok
-            [6] dev_prune         = mean_prune_prev  - C_pru
-            [7] dev_qratio        = mean_qratio_prev - C_q
+            [2] C_tok_target      \in [0,1]
+            [3] C_pru_target      \in [0,1]
+            [4] C_qratio_target   \in [0,1]  (bits/16)
+            [5] dev_keep          = mean_keep_prev   - C_tok_target
+            [6] dev_prune         = mean_prune_prev  - C_pru_target
+            [7] dev_qratio        = mean_qratio_prev - C_qratio_target
       - a_{t-1}  : previous action id                          [B]
     """
     def __init__(
@@ -142,10 +142,12 @@ class RecurrentActorCriticPolicy(nn.Module):
         super().__init__()
         self.n_actions = n_actions
         self.scalar_dim = scalar_dim
-        # We only *use* a subset of the scalar features internally:
-        #   [0] t_frac, [1] eff_flag, [5] dev_keep, [6] dev_prune, [7] dev_qratio
-        # Lambdas [2:5] are ignored here, so callers can keep passing the original 8D vector.
-        kept_scalar_idx = [i for i in (0, 1, 5, 6, 7) if i < scalar_dim]
+        # We condition on:
+        #   [0] t_frac, [1] eff_flag,
+        #   [2] C_tok_target, [3] C_pru_target, [4] C_qratio_target,
+        #   [5] dev_keep, [6] dev_prune, [7] dev_qratio.
+        # If scalar_dim > 8 we drop extras; if < 8 we use the prefix.
+        kept_scalar_idx = list(range(min(8, scalar_dim)))
         self.register_buffer(
             "scalar_keep_idx",
             torch.tensor(kept_scalar_idx, dtype=torch.long),
@@ -206,8 +208,8 @@ class RecurrentActorCriticPolicy(nn.Module):
         temperature: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, PolicyState]:
         B = h_lm.size(0)
-        # Drop lambda_* dimensions inside the policy; keep only
-        # t_frac, eff_flag, dev_keep, dev_prune, dev_qratio.
+        # Keep the first up‑to‑8 structured scalar features
+        # [t_frac, eff_flag, C_tok, C_pru, C_q, dev_keep, dev_prune, dev_qratio].
         if self.scalar_keep_idx is not None:
             scalars_used = torch.index_select(
                 scalars, dim=-1, index=self.scalar_keep_idx.to(scalars.device)
@@ -260,7 +262,7 @@ class RecurrentActorCriticPolicy(nn.Module):
         T, B, _ = h_seq.shape
         device = h_seq.device
         pos = self._positions(T, B, device)  # [T,B]
-        # Same scalar subset as in step(): drop the lambda_* entries.
+        # Same scalar subset as in step(): keep the first up‑to‑8 features.
         if self.scalar_keep_idx is not None:
             scalars_used = torch.index_select(
                 scalars_seq, dim=-1, index=self.scalar_keep_idx.to(scalars_seq.device)
