@@ -579,9 +579,25 @@ def train_one_epoch_grpo(tok,
         qratio_gap = mean_qratio_seq - C_qratio_target_BK       # [BK]
 
         # Squared deviation from the requested target budget; each term is in [0,1].
-        cost_tok_seq    = keep_gap.pow(2)                       # [BK]
-        cost_pru_seq    = prune_gap.pow(2)                      # [BK]
-        cost_qratio_seq = qratio_gap.pow(2)                     # [BK]
+        # cost_tok_seq    = keep_gap.pow(2)                       # [BK]
+        # cost_pru_seq    = prune_gap.pow(2)                      # [BK]
+        # cost_qratio_seq = qratio_gap.pow(2)                     # [BK]
+        tolerance = 0.03
+        cost_pru_seq = torch.where(
+            prune_gap.abs() <= tolerance,
+            torch.zeros_like(prune_gap),
+            prune_gap.sign() * (prune_gap.abs() - tolerance) ** 2,
+        )
+        cost_tok_seq    = torch.where(
+            keep_gap.abs() <= tolerance,
+            torch.zeros_like(keep_gap),
+            keep_gap.sign() * (keep_gap.abs() - tolerance) ** 2,
+        )
+        cost_qratio_seq = torch.where(
+            qratio_gap.abs() <= tolerance,
+            torch.zeros_like(qratio_gap),
+            qratio_gap.sign() * (qratio_gap.abs() - tolerance) ** 2,
+        )
 
         # Broadcast per‑trajectory costs across rollout time to match x_for_adv shape.
         cost_tok = cost_tok_seq.view(1, -1).expand_as(x_for_adv)         # [T, BK]

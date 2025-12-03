@@ -1,4 +1,16 @@
 
+### New Longer Runs post FALURE
+## Non lagrangian
+CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port 29513 train.py   \
+  --wandb_project SOLnL2     --wandb_run_name nLRL_LCE_Prune    \
+   --config /mnt/home/ya255/projects/SOL/official_configs/v3RL_LCE_Prune.yml
+
+
+CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node=1 --master_port 29515 train.py   \
+  --wandb_project SOLnL2     --wandb_run_name nLRL_LCE_Quant    \
+   --config /mnt/home/ya255/projects/SOL/official_configs/v3RL_LCE_Quant.yml
+
+
 ### New Longer Runs
 ## Non lagrangian
 CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port 29513 train.py   \

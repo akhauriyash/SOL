@@ -3,27 +3,101 @@
 # Pruning Only: /mnt/home/ya255/projects/SOL/newckpt/v2RL_LCE_Prune-20251127-095012
 # Joint Method: /mnt/home/ya255/projects/SOL/newckpt/v2RL_LCE_Q8_PQ-20251126-181144
 
-# Prune Only
-SPARSITY_LIST=(0.0)
-# PRUNE_LIST=(-30 -28 -26 -24 -22 -20 -18 -16 -14 -12 -10 -8 -6 -4 -2 0 2 4 6 8 10 12 14 16 18 20) 
-PRUNE_LIST=(24 26 28 30 34 36 38 42 45 48 50 54 58 62 64 -64 -62 -60 -58 -54 -50 -48 -45 -42 -40 -38 -36 -34 -30 -28 -26 -24)
-QUANT_LIST=(0.0)
-for s in "${SPARSITY_LIST[@]}"; do
-  for p in "${PRUNE_LIST[@]}"; do
-    for q in "${QUANT_LIST[@]}"; do
-      time python multi_efficiency_test.py \
-        --ckpt_dir /mnt/home/ya255/projects/SOL/checkpoints/v3RL_LCE_Prune45pc-20251130-101520 \
-        --criteria "quest" \
-        --mode "latest" \
-        --dataset_name wikitext \
-        --outp "prune_only_45pc" \
-        --sparsity_bias "$s" \
-        --prune_bias "$p" \
-        --quant_bias "$q"
-      i=$(( ${i:-0} + 1 )); total=$(( ${#SPARSITY_LIST[@]} * ${#PRUNE_LIST[@]} * ${#QUANT_LIST[@]} )); echo "[${i}/${total}] done s=${s} p=${p} q=${q}"
-    done
-  done
+
+
+# CKPT_DIR="/mnt/home/ya255/projects/SOL/checkpoints/nLRL_LCE_Quant-20251201-224315"
+# CRITERIA="quest"
+# MODE="latest"
+# DATASET_NAME="wikitext"
+# OUTP_PREFIX="quant_withtarget"
+
+# START=-100
+# END=0.7
+# STEP=0.1
+
+# i=0
+# total=$(python - << 'EOF'
+# start = -100
+# end = 0.7
+# step = 0.1
+# import math
+# n = int(math.floor((end - start) / step + 1e-9)) + 1
+# print(n)
+# EOF
+# )
+
+# for p in $(seq ${START} ${STEP} ${END}); do
+#   echo "=== Running prune sweep: tgt_quant_ratio=${p} (${i}/${total}) ==="
+#   time python target_meff.py \
+#     --ckpt_dir "${CKPT_DIR}" \
+#     --criteria "${CRITERIA}" \
+#     --mode "${MODE}" \
+#     --dataset_name "${DATASET_NAME}" \
+#     --outp "${OUTP_PREFIX}" \
+#     --tgt_quant_ratio "${p}"
+
+#   i=$((i + 1))
+#   echo "[${i}/${total}] done tgt_quant_ratio=${p}"
+# done
+
+
+CKPT_DIR="/mnt/home/ya255/projects/SOL/checkpoints/nLRL_LCE_Prune-20251201-224314"
+CRITERIA="quest"
+MODE="latest"
+DATASET_NAME="wikitext"
+OUTP_PREFIX="prune_withtarget"
+
+START=-0.4
+END=0.8
+STEP=0.05
+
+i=0
+total=$(python - << 'EOF'
+start = -0.4
+end = 0.8
+step = 0.05
+import math
+n = int(math.floor((end - start) / step + 1e-9)) + 1
+print(n)
+EOF
+)
+
+for p in $(seq ${START} ${STEP} ${END}); do
+  echo "=== Running prune sweep: tgt_prune_keep=${p} (${i}/${total}) ==="
+  time python target_meff.py \
+    --ckpt_dir "${CKPT_DIR}" \
+    --criteria "${CRITERIA}" \
+    --mode "${MODE}" \
+    --dataset_name "${DATASET_NAME}" \
+    --outp "${OUTP_PREFIX}" \
+    --tgt_prune_keep "${p}"
+
+  i=$((i + 1))
+  echo "[${i}/${total}] done tgt_prune_keep=${p}"
 done
+
+
+# # Prune Only
+# SPARSITY_LIST=(0.0)
+# # PRUNE_LIST=(24 26 28 30 34 36 38 42 45 48 50 54 58 62 64 -64 -62 -60 -58 -54 -50 -48 -45 -42 -40 -38 -36 -34 -30 -28 -26 -24)
+# PRUNE_LIST=(0 5 10 15 20 25 30 35 40 45 50)
+# QUANT_LIST=(0.0)
+# for s in "${SPARSITY_LIST[@]}"; do
+#   for p in "${PRUNE_LIST[@]}"; do
+#     for q in "${QUANT_LIST[@]}"; do
+#       time python target_meff.py \
+#         --ckpt_dir /mnt/home/ya255/projects/SOL/checkpoints/nLRL_LCE_Prune-20251201-224314 \
+#         --criteria "quest" \
+#         --mode "latest" \
+#         --dataset_name wikitext \
+#         --outp "prune_withtarget_spb" \
+#         --sparsity_bias "$s" \
+#         --prune_bias "$p" \
+#         --quant_bias "$q"
+#       i=$(( ${i:-0} + 1 )); total=$(( ${#SPARSITY_LIST[@]} * ${#PRUNE_LIST[@]} * ${#QUANT_LIST[@]} )); echo "[${i}/${total}] done s=${s} p=${p} q=${q}"
+#     done
+#   done
+# done
 
 # # Sparse Only
 # # SPARSITY_LIST=(-10 -9 -8 -7 -6 -5 -4 -3 -2 -1 0 1 2 3 4 5 6 7 8 9 10 12)
