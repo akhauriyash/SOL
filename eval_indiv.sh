@@ -41,11 +41,11 @@
 # done
 
 
-CKPT_DIR="/mnt/home/ya255/projects/SOL/checkpoints/nLRL_LCE_Prune-20251201-224314"
+CKPT_DIR="/mnt/home/ya255/projects/SOL/checkpoints/nLRL_LCE_Prune-20251204-114619"
 CRITERIA="quest"
 MODE="latest"
 DATASET_NAME="wikitext"
-OUTP_PREFIX="prune_withtarget"
+OUTP_PREFIX="prunev5_withtarget"
 
 START=-0.4
 END=0.8

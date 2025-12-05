@@ -171,6 +171,14 @@ class RecurrentActorCriticPolicy(nn.Module):
             self.obs_proj = nn.Linear(in_dim, d_model)
         else:
             self.scalar_proj = nn.Identity()
+
+        # Dedicated head that maps budgets [C_tok, C_pru, C_qratio]
+        # directly into action-logit offsets.
+        self.budget_head = nn.Sequential(
+            nn.Linear(3, 32),
+            nn.GELU(),
+            nn.Linear(32, n_actions),
+        )
         self.pos_emb = nn.Embedding(max_len, d_model)              # learned absolute positions
         self.blocks = nn.ModuleList([_TransformerBlock(d_model, n_heads, mlp_ratio, dropout) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
@@ -210,12 +218,17 @@ class RecurrentActorCriticPolicy(nn.Module):
         B = h_lm.size(0)
         # Keep the first up‑to‑8 structured scalar features
         # [t_frac, eff_flag, C_tok, C_pru, C_q, dev_keep, dev_prune, dev_qratio].
+
         if self.scalar_keep_idx is not None:
             scalars_used = torch.index_select(
                 scalars, dim=-1, index=self.scalar_keep_idx.to(scalars.device)
             )
         else:
             scalars_used = scalars
+
+        # Extract budgets: [C_tok, C_pru, C_qratio] from scalar slots [2:5].
+        # Shape: [B, 3]
+        budgets = scalars_used[:, 2:5]
         x = self._form_step_inputs(
             h_lm,
             e_tok,
@@ -234,7 +247,10 @@ class RecurrentActorCriticPolicy(nn.Module):
             new_v.append(pv)
         h = self.ln_f(h)                        # [B,1,D]
         h_last = h.squeeze(1)                   # [B,D]
-        logits = self.pi(h_last) / max(1e-6, temperature)
+
+        logits_base = self.pi(h_last)           # [B, A]
+        budget_logits = self.budget_head(budgets)  # [B, A]
+        logits = (logits_base + budget_logits) / max(1e-6, temperature)
         value  = self.v(h_last).squeeze(-1)     # [B]
         next_state = PolicyState(past_k=new_k, past_v=new_v, step_idx=state.step_idx + 1, last_action=state.last_action)
         return logits, value, next_state
@@ -263,12 +279,16 @@ class RecurrentActorCriticPolicy(nn.Module):
         device = h_seq.device
         pos = self._positions(T, B, device)  # [T,B]
         # Same scalar subset as in step(): keep the first up‑to‑8 features.
+
         if self.scalar_keep_idx is not None:
             scalars_used = torch.index_select(
                 scalars_seq, dim=-1, index=self.scalar_keep_idx.to(scalars_seq.device)
             )
         else:
             scalars_used = scalars_seq
+
+        # budgets: [T,B,3]
+        budgets = scalars_used[..., 2:5]
 
         x = torch.cat(
             [
@@ -287,7 +307,15 @@ class RecurrentActorCriticPolicy(nn.Module):
             h, _, _ = block(h, past_k=None, past_v=None, use_cache=False)
         h = self.ln_f(h)                             # [B,T,D_model]
 
-        logits = self.pi(h) / max(1e-6, temperature) # [B,T,A]
+        logits_base = self.pi(h)                     # [B,T,A]
+
+        # Flatten budgets for budget_head: [T*B, 3] -> [T*B, A] -> [T,B,A]
+        TB = T * B
+        budgets_flat = budgets.reshape(TB, 3)
+        budget_logits_flat = self.budget_head(budgets_flat)      # [TB, A]
+        budget_logits = budget_logits_flat.view(T, B, -1).transpose(0, 1)  # [B,T,A]
+
+        logits = (logits_base + budget_logits) / max(1e-6, temperature)
         values = self.v(h).squeeze(-1)               # [B,T]
 
         return logits.transpose(0, 1), values.transpose(0, 1)
