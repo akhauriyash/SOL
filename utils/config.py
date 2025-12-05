@@ -55,9 +55,12 @@ class Config:
 
     # --- Multi-budget GRPO (no Lagrangian) ---
     # Per-rollout budgets will be sampled from these sets (normalized 0–1 ranges).
-    budget_tok_list: Tuple[float, ...] = (0.25, 0.5, 0.75)
-    budget_prune_list: Tuple[float, ...] = (0.3, 0.5, 0.7, 0.9)
-    budget_q_ratio_list: Tuple[float, ...] = (0.25, 0.5, 0.75)  # qratio = bits / 16
+    budget_tok_list: Tuple[float, ...] = None
+    budget_prune_list: Tuple[float, ...] = None
+    budget_q_ratio_list: Tuple[float, ...] = None
+    # (0.25, 0.5, 0.75)  # qratio = bits / 16    # (0.25, 0.5, 0.75)
+    # (0.3, 0.5, 0.7, 0.9)
+
     eval_C_tok: Optional[float] = None
     eval_C_pru: Optional[float] = None
     eval_C_qbits: Optional[float] = None
