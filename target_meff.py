@@ -404,9 +404,9 @@ if 'action_probs' in fixed_matched:
 
 import csv
 
-csv_path = "multi_eff_ppl_scan.csv"
+csv_path = "meffsc.csv"
 if args.outp != "":
-    csv_path = args.outp + "_multi_eff_ppl_scan.csv"
+    csv_path = args.outp + "_meffsc.csv"
 
 ckpt_dir_last = os.path.basename(os.path.normpath(E.CKPT_DIR))
 
@@ -443,6 +443,16 @@ row = {
 
     "fixed_levels_kappa_order": fixed_levels_kappa_order,
     "fixed_action_probs_kappa_order": fixed_action_probs,
+
+    "sparsity_criteria": cfg.sparsity_criteria,
+
+    "sparsity_bias": cfg.eval_sparsity_bias,
+    "prune_bias": cfg.eval_prune_bias,
+    "quant_bias": cfg.eval_quant_bias,
+
+    "tgt_keep_cli": float(eval_C_tok) if eval_C_tok is not None else None,
+    "tgt_prune_keep_cli": float(eval_C_pru) if eval_C_pru is not None else None,
+    "tgt_quant_ratio_cli": float(eval_C_qbits / 16.0) if eval_C_qbits is not None else None,
 }
 
 fieldnames = list(row.keys())

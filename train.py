@@ -42,10 +42,10 @@ from utils.cache import detach_cache_to_tuple
 from utils.probe import probe_losses_with_lookahead
 from utils.eval import (
     evaluate_stateful_policy_rollout,
-    evaluate_sft_teacher_matched_keep,
 )
 from utils.eval_baselines import (
     evaluate_dense_full,
+    evaluate_fixed_matched_keep,
 )
 from utils.masks import enable_quest_attention, enable_relevancy_attention
 
@@ -652,21 +652,38 @@ def train_one_epoch_grpo(tok,
                     avg_quant_ratio = float(sparse_stats.get("avg_quant_ratio", 0.0))
 
                     # If there are no structural/pruning/quant DOFs, treat this as the
-                    # single-budget regime and compare to an SFT teacher matched on keep.
+                    # single-budget regime and compare to a fixed matched baseline
+                    # evaluated at the *actual* policy budgets.
                     if (not has_prune_dof) and (not has_quant_dof):
-                        teach = evaluate_sft_teacher_matched_keep(
-                            cfg, model, val_dl, Ts=cfg.Ts, Tw=cfg.Tw, keep_fracs=tuple(cfg.keep_fracs),
-                            target_keep_effective=float(sparse_stats["avg_keep_effective"]),
-                            context_len=cfg.context_len, rollout_len=cfg.rollout_len, device=cfg.device,
+                        policy_keep_eff_actual   = float(sparse_stats["avg_keep_effective"])
+                        policy_prune_keep_actual = avg_prune_keep
+                        policy_quant_ratio_actual = avg_quant_ratio
+
+                        fixed_matched = evaluate_fixed_matched_keep(
+                            cfg,
+                            model,
+                            val_dl,
+                            Ts=cfg.Ts,
+                            Tw=cfg.Tw,
+                            keep_fracs=tuple(cfg.keep_fracs),
+                            prune_choices=getattr(cfg, "struct_prune_choices", ("s100",)),
+                            quant_choices=getattr(cfg, "quant_choices", ("q16",)),
+                            target_keep_effective=policy_keep_eff_actual,
+                            target_prune_keep=policy_prune_keep_actual,
+                            target_quant_ratio=policy_quant_ratio_actual,
+                            context_len=cfg.context_len,
+                            rollout_len=cfg.rollout_len,
+                            device=cfg.device,
+                            struct_on_non_eff=False,
                         )
-                        gap_nats = math.log(sparse_stats["ppl"]) - math.log(teach["ppl"])
-                        gap_ratio = sparse_stats["ppl"] / teach["ppl"]
+                        gap_nats = math.log(sparse_stats["ppl"]) - math.log(fixed_matched["ppl"])
+                        gap_ratio = sparse_stats["ppl"] / fixed_matched["ppl"]
                         if run is not None:
                             run.log({
-                                "special/gap_to_teacher_ln_ppl": gap_nats,
+                                "special/gap_to_fixed_ln_ppl": gap_nats,
                                 "special/avg_keep_effective": sparse_stats["avg_keep_effective"],
-                                "special/gap_ratio_to_teacher": gap_ratio,
-                                "special/teacher_ppl": teach["ppl"],
+                                "special/gap_ratio_to_fixed": gap_ratio,
+                                "special/fixed_ppl": fixed_matched["ppl"],
                                 "special/sparse_ppl": sparse_stats["ppl"],
                                 "special/avg_prune_keep": avg_prune_keep,
                                 "special/avg_quant_ratio": avg_quant_ratio,
@@ -1183,20 +1200,37 @@ def train_one_epoch_sft(
                         lambda_prune=float(global_step_state.get("lambda_prune", 0.0)),
                         lambda_quant=float(global_step_state.get("lambda_quant", 0.0)),
                     )
-                    teach_val = evaluate_sft_teacher_matched_keep(
-                        cfg, model, val_dl, Ts=cfg.Ts, Tw=cfg.Tw,
+                    
+                    # Match a fixed baseline to the *actual* policy budgets.
+                    policy_keep_eff_actual = float(sparse_stats["avg_keep_effective"])
+                    policy_prune_keep_actual = float(sparse_stats.get("avg_prune_keep", 0.0))
+                    policy_quant_ratio_actual = float(sparse_stats.get("avg_quant_ratio", 0.0))
+
+                    fixed_matched = evaluate_fixed_matched_keep(
+                        cfg,
+                        model,
+                        val_dl,
+                        Ts=cfg.Ts,
+                        Tw=cfg.Tw,
                         keep_fracs=tuple(cfg.keep_fracs),
-                        target_keep_effective=C_target,
-                        context_len=cfg.context_len, rollout_len=cfg.rollout_len,
+                        prune_choices=getattr(cfg, "struct_prune_choices", ("s100",)),
+                        quant_choices=getattr(cfg, "quant_choices", ("q16",)),
+                        target_keep_effective=policy_keep_eff_actual,
+                        target_prune_keep=policy_prune_keep_actual,
+                        target_quant_ratio=policy_quant_ratio_actual,
+                        context_len=cfg.context_len,
+                        rollout_len=cfg.rollout_len,
                         device=cfg.device,
+                        struct_on_non_eff=False,
                     )
-                    gap_nats = math.log(sparse_stats["ppl"]) - math.log(teach_val["ppl"])
-                    gap_ratio = sparse_stats["ppl"] / teach_val["ppl"]
+
+                    gap_nats = math.log(sparse_stats["ppl"]) - math.log(fixed_matched["ppl"])
+                    gap_ratio = sparse_stats["ppl"] / fixed_matched["ppl"]
                     run.log({
-                        "special/gap_to_teacher_ln_ppl": float(gap_nats),
+                        "special/gap_to_fixed_ln_ppl": float(gap_nats),
                         "special/avg_keep_effective": float(sparse_stats["avg_keep_effective"]),
-                        "special/gap_ratio_to_teacher": float(gap_ratio),
-                        "special/teacher_ppl": float(teach_val["ppl"]),
+                        "special/gap_ratio_to_fixed": float(gap_ratio),
+                        "special/fixed_ppl": float(fixed_matched["ppl"]),
                         "special/sparse_ppl": float(sparse_stats["ppl"]),
                         "update_step": upd,
                     })
@@ -1347,7 +1381,7 @@ def main():
         snapshot_code(ckpt_dir, root_dir=os.getcwd(), skip_dirs = [
                 ".venv", ".git", "__pycache__", "wandb", "checkpoints", "block_cache",
                 "official_configs", "official_results", "newckpt", "old_ch", "sol",
-                "dec1_checkpoints", "dec6_checkpoints", "dec6_backup"
+                "dec1_checkpoints", "dec6_checkpoints", "dec6_backup", "current_valid"
             ])
         try:
             with open(os.path.join(ckpt_dir, "train_meta.json"), "w") as f:
