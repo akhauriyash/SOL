@@ -7,7 +7,7 @@
   "reward_agg": "sum",
   "reward_gamma": 0.85,
 
-  "keep_fracs": [0.05, 0.2, 1.0],
+  "keep_fracs": [0.2, 1.0],
   "struct_prune_choices": ["s100"],
   "quant_choices": ['q16'],
   "C_target": 0.5,
@@ -16,7 +16,7 @@
   "C_target_quant_bits": 16,
   "enable_prune_quant": true,
 
-  "budget_tok_min": 0.05,
+  "budget_tok_min": 0.4,
   "budget_tok_max": 1.0,
   "budget_prune_list": [1.0],
   "budget_q_ratio_list": [1.0],

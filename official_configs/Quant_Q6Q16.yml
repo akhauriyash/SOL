@@ -2,31 +2,30 @@
   "model_name": "meta-llama/Llama-3.2-1B",
 
   "algo": "grpo",
-  "sparsity_criteria": "quest",
+  "sparsity_criteria": "recency",
   "quest_page_size": 4,
   "reward_agg": "sum",
   "reward_gamma": 0.85,
 
-  "keep_fracs": [0.05, 0.2, 1.0],
+  "keep_fracs": [1.0],
   "struct_prune_choices": ["s100"],
-  "quant_choices": ['q16'],
-  "C_target": 0.5,
-  "keep_target": 0.5,
+  "quant_choices": ["q6", "q16"],
+  "C_target": 1.0,
   "C_target_prune": 1.0,
-  "C_target_quant_bits": 16,
+  "C_target_quant_bits": 7,
   "enable_prune_quant": true,
-
-  "budget_tok_min": 0.05,
-  "budget_tok_max": 1.0,
+  "budget_tok_list": [1.0],
   "budget_prune_list": [1.0],
-  "budget_q_ratio_list": [1.0],
-
-  "alpha_tok": 100.0,
+  "budget_q_ratio_min": 0.375,
+  "budget_q_ratio_max": 1.0,
+  "alpha_tok": 0.0,
   "alpha_prune": 0.0,
-  "alpha_quant": 0.0,
+  "alpha_quant": 200.0,
+
 
   "grpo_level": "process",
   "task_w_kl": 0.0,
+  "keep_target": 1.0,
   "horizon": 4,
   "pi_temperature": 1.3,
 

@@ -589,7 +589,7 @@ def train_one_epoch_grpo(tok,
         avg_abs_prune_gap  = float(prune_gap.abs().mean().item())
         avg_abs_qratio_gap = float(qratio_gap.abs().mean().item())
             
-        tolerance = 0.03
+        tolerance = 0.02
 
         def huber_sq(gap, tol):
             dev = gap.abs() - tol

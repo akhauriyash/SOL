@@ -8,15 +8,15 @@
   "reward_gamma": 0.85,
 
   "keep_fracs": [1.0],
-  "struct_prune_choices": ['s35', 's40', 's50', 's60', 's70', 's80', 's90', 's100'],
+  "struct_prune_choices": ['s40', 's70', 's100'],
   "quant_choices": ['q16'],
   "C_target": 1.0,
-  "C_target_prune": 0.65,
+  "C_target_prune": 0.6,
   "C_target_quant_bits": 16,
   "enable_prune_quant": true,
 
   "budget_tok_list": [1.0],
-  "budget_prune_min": 0.35,
+  "budget_prune_min": 0.4,
   "budget_prune_max": 1.00,
   "budget_q_ratio_list": [1.0],
 

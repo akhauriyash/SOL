@@ -3,7 +3,7 @@ import json
 import time
 import argparse
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 
 import torch
 import torch.backends.cuda as sdp
@@ -11,49 +11,39 @@ import torch.backends.cuda as sdp
 from utils.seeds import set_seed
 from utils.model import load_lm_and_tokenizer
 from utils.data import make_dataloader, limited_dl
-from utils.eval_baselines import (
-    evaluate_randomized_matched_sparsity,
-    evaluate_dense_full,
-)
+from utils.eval_baselines import evaluate_randomized_matched_sparsity
 from utils.config import Config
+
+import csv
+from datetime import datetime
 
 # SDPA settings (same as your existing script)
 sdp.enable_flash_sdp(False)
 sdp.enable_math_sdp(False)
 sdp.enable_mem_efficient_sdp(True)  # SDPA only
 
-
-# python eval_random_alloc.py \
-#   --ckpt_dir /mnt/home/ya255/projects/SOL/current_valid/nLRL_LCE_Quant-20251205-111229 \
-#   --mode latest \
-#   --dataset_name wikitext \
-#   --tgt_keep 1.0 \
-#   --tgt_prune 0.65 \
-#   --tgt_quant 1.0 \
-#   --quant_choices q16 \
-#   --prune_choices s100,s30 \
-
-# python eval_random_alloc.py \
-#   --ckpt_dir /mnt/home/ya255/projects/SOL/current_valid/nLRL_LCE_Quant-20251205-111229 \
-#   --mode latest \
-#   --dataset_name wikitext \
+# python action_variability.py \
 #   --tgt_keep 1.0 \
 #   --tgt_prune 1.0 \
 #   --tgt_quant 0.4 \
-#   --quant_choices q5,q16 \
+#   --quant_choices q5,q8,q16 \
 #   --prune_choices s100 \
-#   --eval_batches 100
+#   --eval_batches 100 \
+#   --seed 5612 \
+#   --num_trials 10 \
+#   --csv_path action_variability.csv
+
 
 # -------------------------
 # Basic eval configuration
 # -------------------------
 @dataclass
 class EvalRandomCfg:
-    CKPT_DIR: str = "/home/ya255/rl4e/checkpoints/GRPO_DKL_Relv-20251017-002523/"
+    CKPT_DIR: str = "/mnt/home/ya255/projects/SOL/current_valid/nLRL_LCE_TokSparse-20251205-233007"
     eval_batches: Optional[int] = None   # None = full loader
     split: str = "validation"
     mode: str = "latest"                 # "latest" or "best"
-    dataset_name: Optional[str] = "allenai/c4"
+    dataset_name: Optional[str] = "wikitext"
     dataset_config: Optional[str] = "en"
     text_field: Optional[str] = "text"
     batch_size: Optional[int] = 16
@@ -155,17 +145,44 @@ def load_cfg_from_checkpoint_or_yaml(
     return cfg
 
 
+def sanitize_csv_field(value) -> str:
+    """
+    Convert anything to a string and replace commas with '|' so that
+    CSV delimiter logic (',') is never confused.
+    """
+    if value is None:
+        return ""
+    s = str(value)
+    return s.replace(",", "|")
+
+def join_list(values, float_fmt: Optional[str] = None) -> str:
+    """
+    Join a list/tuple (or single value) into a '|' separated string.
+    If float_fmt is provided, apply it to each element.
+    Robust against accidentally passing scalars or strings.
+    """
+    # If we get a scalar or string, treat it as a single element
+    if isinstance(values, str) or not isinstance(values, (list, tuple)):
+        values = [values]
+
+    out = []
+    for v in values:
+        if float_fmt is not None:
+            out.append(float_fmt.format(v))
+        else:
+            out.append(str(v))
+    return "|".join(out)
 # -------------------------
 # Main
 # -------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Random quantization/pruning/sparsity evaluation (no policy)."
+        description="Repeat random quant/prune/sparsity evaluation for variability, log to CSV."
     )
     parser.add_argument("--ckpt_dir", type=str, default=None)
     parser.add_argument("--mode", type=str, default=None, choices=["latest", "best"])
     parser.add_argument(
-        "--dataset_name", type=str, choices=["wikitext", "allenai/c4"], default=None
+        "--dataset_name", type=str, choices=["wikitext", "allenai/c4"], default="wikitext"
     )
     parser.add_argument("--eval_batches", type=int, default=None)
 
@@ -207,9 +224,21 @@ def main():
         help="Comma-separated pruning choices, e.g. 's100,s75,s50'. "
              "If not set, uses cfg.struct_prune_choices.",
     )
+    parser.add_argument(
+        "--keep_fracs",
+        type=str,
+        default=None,
+        help="Comma-separated keep_fracs, e.g. '1.0,0.5,0.25'. "
+             "If not set, uses cfg.keep_fracs (from training/checkpoint).",
+    )
 
     parser.add_argument("--batch_size", type=int, default=None)
-    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--seed", type=int, default=1234,
+                        help="Base seed; each trial uses seed+i.")
+    parser.add_argument("--num_trials", type=int, default=5,
+                        help="Number of random allocation trials.")
+    parser.add_argument("--csv_path", type=str, default="random_alloc_results.csv",
+                        help="Path to CSV file to append results to.")
 
     args = parser.parse_args()
 
@@ -229,10 +258,7 @@ def main():
     if args.batch_size is not None:
         E.batch_size = args.batch_size
     if args.seed is not None:
-        E.seed = args.seed
-
-    # --- Seed everything (for reproducible randomness) ---
-    set_seed(E.seed)
+        E.seed = args.seed 
 
     # --- Find and load checkpoint (just for cfg/meta; not using policy) ---
     ckpt_path = find_latest_ckpt(E.CKPT_DIR, E.mode)
@@ -247,20 +273,6 @@ def main():
         text_field=E.text_field,
         batch_size=E.batch_size,
     )
-
-    # Override eval batch size if needed
-    if E.batch_size is not None:
-        cfg.batch_size = E.batch_size
-
-    # Optional: override quant/prune choices from CLI
-    if args.quant_choices is not None:
-        cfg.quant_choices = tuple(
-            [q.strip() for q in args.quant_choices.split(",") if q.strip()]
-        )
-    if args.prune_choices is not None:
-        cfg.struct_prune_choices = tuple(
-            [p.strip() for p in args.prune_choices.split(",") if p.strip()]
-        )
 
     # Load checkpoint once more just to possibly pick up updated keep_fracs
     sd = torch.load(ckpt_path, map_location="cpu")
@@ -281,12 +293,25 @@ def main():
     else:
         print("[ckpt] No meta found in checkpoint.")
 
-    # # In your current setup you use "quest" sparsity criteria; keep the same assert
-    # assert cfg.sparsity_criteria == "quest", (
-    #     "This eval script currently assumes 'quest' sparsity_criteria. "
-    #     "Adjust if you're using another scheme."
-    # )
+    # Override eval batch size if needed
+    if E.batch_size is not None:
+        cfg.batch_size = E.batch_size
 
+    # Optional: override quant/prune choices from CLI
+    if args.quant_choices is not None:
+        cfg.quant_choices = tuple(
+            [q.strip() for q in args.quant_choices.split(",") if q.strip()]
+        )
+    if args.prune_choices is not None:
+        cfg.struct_prune_choices = tuple(
+            [p.strip() for p in args.prune_choices.split(",") if p.strip()]
+        )
+
+    if args.keep_fracs is not None:
+        cfg.keep_fracs = tuple(
+            float(x.strip()) for x in args.keep_fracs.split(",") if x.strip()
+        )
+        print(f"[cfg] Overriding keep_fracs from CLI: {cfg.keep_fracs}")
     # --- Load LM and tokenizer ---
     tok, model = load_lm_and_tokenizer(cfg)
 
@@ -310,28 +335,6 @@ def main():
         f"context_len={cfg.context_len}  rollout_len={cfg.rollout_len}\n"
     )
 
-    # -------------------------
-    # Dense baseline (optional but useful for comparison)
-    # -------------------------
-    print("Running dense baseline (no sparsity / no quant / no pruning)...")
-    start_time = time.time()
-    dense_res = evaluate_dense_full(
-        model,
-        limited_dl(dl, E.eval_batches),
-        cfg.context_len,
-        cfg.rollout_len,
-        cfg.device,
-    )
-    dense_time = time.time() - start_time
-
-    print(
-        f"\nDense baseline\t\t: ppl={dense_res['ppl']:.3f}  "
-        f"tokens={dense_res['tokens']}\t(time={dense_time:.2f}s)\n"
-    )
-
-    # -------------------------
-    # Randomized matched evaluation
-    # -------------------------
     print(
         "Running RANDOM allocation with user-specified targets:\n"
         f"  tgt_keep_eff={args.tgt_keep:.4f}, "
@@ -340,58 +343,150 @@ def main():
         f"(~{16 * args.tgt_quant:.2f} effective bits)\n"
     )
 
-    start_time = time.time()
-    rand_res = evaluate_randomized_matched_sparsity(
-        cfg,
-        model,
-        limited_dl(dl, E.eval_batches),
-        Ts=cfg.Ts,
-        Tw=cfg.Tw,
-        keep_fracs=cfg.keep_fracs,
-        prune_choices=getattr(cfg, "struct_prune_choices", ("s100",)),
-        quant_choices=getattr(cfg, "quant_choices", ("q16",)),
-        target_keep_effective=args.tgt_keep,
-        target_prune_keep=args.tgt_prune,
-        target_quant_ratio=args.tgt_quant,
-        context_len=cfg.context_len,
-        rollout_len=cfg.rollout_len,
-        device=cfg.device,
-        struct_on_non_eff=False,
-    )
-    rand_time = time.time() - start_time
+    # -------------------------
+    # Repeat random allocation multiple times
+    # -------------------------
+    ppl_trials: List[float] = []
+    keep_eff_trials: List[float] = []
+    prune_keep_trials: List[float] = []
+    quant_bits_trials: List[float] = []
+    tokens_eff_trials: List[int] = []
+    tokens_trials: List[int] = []
+    seeds_used: List[int] = []
+
+    for i in range(args.num_trials):
+        trial_seed = args.seed + i
+        seeds_used.append(trial_seed)
+        set_seed(trial_seed)
+
+        print(f"\n[trial {i+1}/{args.num_trials}] seed={trial_seed}")
+        start_time = time.time()
+        rand_res = evaluate_randomized_matched_sparsity(
+            cfg,
+            model,
+            limited_dl(dl, E.eval_batches),
+            Ts=cfg.Ts,
+            Tw=cfg.Tw,
+            keep_fracs=cfg.keep_fracs,
+            prune_choices=getattr(cfg, "struct_prune_choices", ("s100",)),
+            quant_choices=getattr(cfg, "quant_choices", ("q16",)),
+            target_keep_effective=args.tgt_keep,
+            target_prune_keep=args.tgt_prune,
+            target_quant_ratio=args.tgt_quant,
+            context_len=cfg.context_len,
+            rollout_len=cfg.rollout_len,
+            device=cfg.device,
+            struct_on_non_eff=False,
+        )
+        trial_time = time.time() - start_time
+
+        ppl = rand_res["ppl"]
+        keep_eff = rand_res["avg_keep_effective"]
+        prune_keep = rand_res["avg_prune_keep"]
+        quant_bits = 16.0 * rand_res["avg_quant_ratio"]
+        tokens_eff = rand_res["tokens_effective"]
+        tokens_total = rand_res["tokens"]
+
+        ppl_trials.append(ppl)
+        keep_eff_trials.append(keep_eff)
+        prune_keep_trials.append(prune_keep)
+        quant_bits_trials.append(quant_bits)
+        tokens_eff_trials.append(tokens_eff)
+        tokens_trials.append(tokens_total)
+
+        print(
+            f"[trial {i+1}] ppl={ppl:.3f}  "
+            f"keep_eff={keep_eff:.3f}  "
+            f"prune_keep={prune_keep:.3f}  "
+            f"quant_bits={quant_bits:.3f}  "
+            f"tokens={tokens_eff}/{tokens_total}  "
+            f"(time={trial_time:.2f}s)"
+        )
+        print(f"Frequency: ", rand_res["action_probs"])
 
     # -------------------------
-    # Print summary
+    # Write CSV row
     # -------------------------
-    print(
-        f"\nRandom alloc\t\t: ppl={rand_res['ppl']:.3f}  "
-        f"keep_all={rand_res['avg_keep_all']:.3f}  "
-        f"keep_eff={rand_res['avg_keep_effective']:.3f}  "
-        f"prune_keep={rand_res['avg_prune_keep']:.3f}  "
-        f"quant_ratio={16 * rand_res['avg_quant_ratio']:.3f}  "
-        f"tokens={rand_res['tokens_effective']}/{rand_res['tokens']}\t"
-        f"(time={rand_time:.2f}s)\n"
-    )
+    csv_path = args.csv_path
+    csv_exists = os.path.exists(csv_path)
 
-    if "action_probs" in rand_res:
-        probs = ", ".join(f"{p:.3f}" for p in rand_res["action_probs"])
-        levels = ", ".join(f"{k:.3f}" for k in cfg.keep_fracs)
-        print(f"Sparsity levels (κ order)      : [{levels}]")
-        print(f"Random action probs (κ order)  : [{probs}]")
+    fieldnames = [
+        "timestamp",
+        "ckpt_dir",
+        "ckpt_path",
+        "mode",
+        "dataset_name",
+        "dataset_config",
+        "split",
+        "eval_batches",
+        "batch_size",
+        "num_trials",
+        "seeds",
+        "tgt_keep",
+        "tgt_prune",
+        "tgt_quant",
+        "quant_choices",
+        "prune_choices",
+        "Ts",
+        "Tw",
+        "keep_fracs",
+        "context_len",
+        "rollout_len",
+        "ppl_trials",
+        "keep_eff_trials",
+        "prune_keep_trials",
+        "quant_bits_trials",
+        "tokens_eff_trials",
+        "tokens_trials",
+    ]
 
-    print("\n=== Comparison (validation) ===\n")
-    print(
-        f"Dense baseline\t\t: ppl={dense_res['ppl']:.3f}  "
-        f"tokens={dense_res['tokens']}"
-    )
-    print(
-        f"Random alloc\t\t: ppl={rand_res['ppl']:.3f}  "
-        f"keep_all={rand_res['avg_keep_all']:.3f}  "
-        f"keep_eff={rand_res['avg_keep_effective']:.3f}  "
-        f"prune_keep={rand_res['avg_prune_keep']:.3f}  "
-        f"quant_ratio={16 * rand_res['avg_quant_ratio']:.3f}  "
-        f"tokens={rand_res['tokens_effective']}/{rand_res['tokens']}"
-    )
+    # Build row dict, sanitizing anything that might have commas
+    row = {
+        "timestamp": datetime.now().isoformat(),
+        "ckpt_dir": sanitize_csv_field(E.CKPT_DIR),
+        "ckpt_path": sanitize_csv_field(ckpt_path),
+        "mode": sanitize_csv_field(E.mode),
+        "dataset_name": sanitize_csv_field(E.dataset_name),
+        "dataset_config": sanitize_csv_field(E.dataset_config),
+        "split": sanitize_csv_field(E.split),
+        "eval_batches": sanitize_csv_field(E.eval_batches),
+        "batch_size": sanitize_csv_field(cfg.batch_size),
+        "num_trials": sanitize_csv_field(args.num_trials),
+        "seeds": sanitize_csv_field(join_list(seeds_used)),
+        "tgt_keep": sanitize_csv_field(args.tgt_keep),
+        "tgt_prune": sanitize_csv_field(args.tgt_prune),
+        "tgt_quant": sanitize_csv_field(args.tgt_quant),
+        "quant_choices": sanitize_csv_field(
+            join_list(getattr(cfg, "quant_choices", ("q16",)))
+        ),
+        "prune_choices": sanitize_csv_field(
+            join_list(getattr(cfg, "struct_prune_choices", ("s100",)))
+        ),
+        # Ts/Tw can be plain ints; don't assume they're iterable
+        "Ts": sanitize_csv_field(cfg.Ts),
+        "Tw": sanitize_csv_field(cfg.Tw),
+        "keep_fracs": sanitize_csv_field(
+            join_list(getattr(cfg, "keep_fracs", []), float_fmt="{:.4f}")
+        ),
+        "context_len": sanitize_csv_field(cfg.context_len),
+        "rollout_len": sanitize_csv_field(cfg.rollout_len),
+        "ppl_trials": sanitize_csv_field(join_list(ppl_trials, float_fmt="{:.6f}")),
+        "keep_eff_trials": sanitize_csv_field(join_list(keep_eff_trials, float_fmt="{:.6f}")),
+        "prune_keep_trials": sanitize_csv_field(join_list(prune_keep_trials, float_fmt="{:.6f}")),
+        "quant_bits_trials": sanitize_csv_field(join_list(quant_bits_trials, float_fmt="{:.6f}")),
+        "tokens_eff_trials": sanitize_csv_field(join_list(tokens_eff_trials)),
+        "tokens_trials": sanitize_csv_field(join_list(tokens_trials)),
+    }
+
+    # Append to CSV
+    with open(csv_path, mode="a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not csv_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+    print(f"\n[done] Appended results to CSV: {csv_path}\n")
+    print("Trials ppl:", join_list(ppl_trials, float_fmt="{:.3f}"))
 
 
 if __name__ == "__main__":
