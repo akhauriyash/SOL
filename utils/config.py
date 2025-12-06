@@ -58,6 +58,13 @@ class Config:
     budget_tok_list: Tuple[float, ...] = None
     budget_prune_list: Tuple[float, ...] = None
     budget_q_ratio_list: Tuple[float, ...] = None
+
+    budget_prune_min : float = None
+    budget_prune_max : float = None
+    budget_q_ratio_min : float = None
+    budget_q_ratio_max : float = None
+    budget_tok_min : float = None
+    budget_tok_max : float = None
     # (0.25, 0.5, 0.75)  # qratio = bits / 16    # (0.25, 0.5, 0.75)
     # (0.3, 0.5, 0.7, 0.9)
 

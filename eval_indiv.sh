@@ -41,21 +41,21 @@
 # done
 
 
-CKPT_DIR="/mnt/home/ya255/projects/SOL/checkpoints/nLRL_LCE_Prune-20251204-114619"
+CKPT_DIR="/mnt/home/ya255/projects/SOL/checkpoints/nLRL_LCE_Prune-20251205-111230"
 CRITERIA="quest"
 MODE="latest"
 DATASET_NAME="wikitext"
-OUTP_PREFIX="prunev5_withtarget"
+OUTP_PREFIX="prunev_f_withtarget"
 
-START=-0.4
-END=0.8
-STEP=0.05
+START=0.21
+END=0.93
+STEP=0.03
 
 i=0
 total=$(python - << 'EOF'
-start = -0.4
-end = 0.8
-step = 0.05
+start = 0.21
+end = 0.93
+step = 0.03
 import math
 n = int(math.floor((end - start) / step + 1e-9)) + 1
 print(n)

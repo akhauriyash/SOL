@@ -239,6 +239,7 @@ def train_one_epoch_grpo(tok,
         C_pru_target_B = _sample_budget_1d("budget_prune", C_pru_default)        # [B]
         # Quantization budget uses qratio = bits/16 in [0,1].
         C_qratio_target_B = _sample_budget_1d("budget_q_ratio", C_q_default)     # [B]
+
         if global_step_state.get("save_stride") in (None, 0):
             try:
                 num_batches = len(dl)
@@ -567,6 +568,7 @@ def train_one_epoch_grpo(tok,
                 x_for_adv = returns[0].unsqueeze(0).expand_as(r_task_all)  # shape [T, BK]
             else:
                 x_for_adv = returns
+                
         sum_eff_seq    = eff_all.sum(dim=0).clamp_min(1.0)               # [BK]
         mean_keep_seq  = (eff_all * keep_all).sum(dim=0) / sum_eff_seq   # [BK]
         prune_all_ratio = prune_all / P_MAX
@@ -578,28 +580,14 @@ def train_one_epoch_grpo(tok,
         prune_gap  = mean_prune_seq - C_pru_target_BK           # [BK]
         qratio_gap = mean_qratio_seq - C_qratio_target_BK       # [BK]
 
-        # Squared deviation from the requested target budget; each term is in [0,1].
-        # cost_tok_seq    = keep_gap.pow(2)                       # [BK]
-        # cost_pru_seq    = prune_gap.pow(2)                      # [BK]
-        # cost_qratio_seq = qratio_gap.pow(2)                     # [BK]
+        # For logging: batch-mean requested budgets and adherence
+        mean_C_tok_target_batch    = float(C_tok_target_BK.mean().item())
+        mean_C_pru_target_batch    = float(C_pru_target_BK.mean().item())
+        mean_C_qratio_target_batch = float(C_qratio_target_BK.mean().item())
 
-        # tolerance = 0.03
-        # cost_pru_seq = torch.where(
-        #     prune_gap.abs() <= tolerance,
-        #     torch.zeros_like(prune_gap),
-        #     prune_gap.sign() * (prune_gap.abs() - tolerance) ** 2,
-        # )
-        # cost_tok_seq    = torch.where(
-        #     keep_gap.abs() <= tolerance,
-        #     torch.zeros_like(keep_gap),
-        #     keep_gap.sign() * (keep_gap.abs() - tolerance) ** 2,
-        # )
-        # cost_qratio_seq = torch.where(
-        #     qratio_gap.abs() <= tolerance,
-        #     torch.zeros_like(qratio_gap),
-        #     qratio_gap.sign() * (qratio_gap.abs() - tolerance) ** 2,
-        # )
-    
+        avg_abs_keep_gap   = float(keep_gap.abs().mean().item())
+        avg_abs_prune_gap  = float(prune_gap.abs().mean().item())
+        avg_abs_qratio_gap = float(qratio_gap.abs().mean().item())
             
         tolerance = 0.03
 
@@ -881,7 +869,14 @@ def train_one_epoch_grpo(tok,
                 # In the multi‑budget regime, "budget_gap_token" is keep_mean − E[C_tok_target].
                 "train/budget_gap_token": budget_gap_token,
                 "train/ppl_approx": ppl_approx,
-                
+                # Budget sampling (what we asked for, on average this batch)
+                "budgets/target_tok_mean":    mean_C_tok_target_batch,
+                "budgets/target_prune_mean":  mean_C_pru_target_batch,
+                "budgets/target_qratio_mean": mean_C_qratio_target_batch,
+                # Budget adherence (how far we are from what we asked for)
+                "budgets/abs_keep_gap_mean":   avg_abs_keep_gap,
+                "budgets/abs_prune_gap_mean":  avg_abs_prune_gap,
+                "budgets/abs_qratio_gap_mean": avg_abs_qratio_gap,
                 "reward_comps/r_total_mean": mean_r_total,
                 "reward_comps/x_for_adv_mean": mean_x_for_adv,
                 "reward_comps/computational_component_mean": mean_comp,
@@ -1352,7 +1347,7 @@ def main():
         snapshot_code(ckpt_dir, root_dir=os.getcwd(), skip_dirs = [
                 ".venv", ".git", "__pycache__", "wandb", "checkpoints", "block_cache",
                 "official_configs", "official_results", "newckpt", "old_ch", "sol",
-                "dec1_checkpoints", 
+                "dec1_checkpoints", "dec6_checkpoints", "dec6_backup"
             ])
         try:
             with open(os.path.join(ckpt_dir, "train_meta.json"), "w") as f:
