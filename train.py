@@ -1378,11 +1378,16 @@ def main():
     if is_main:
         ckpt_dir = os.path.join("checkpoints", (run.name if run is not None else f"RL4E-SFT-{timestamp}"))
         os.makedirs(ckpt_dir, exist_ok=True)
-        snapshot_code(ckpt_dir, root_dir=os.getcwd(), skip_dirs = [
-                ".venv", ".git", "__pycache__", "wandb", "checkpoints", "block_cache",
-                "official_configs", "official_results", "newckpt", "old_ch", "sol",
-                "dec1_checkpoints", "dec6_checkpoints", "dec6_backup", "current_valid"
-            ])
+        # snapshot_code(ckpt_dir, root_dir=os.getcwd(), skip_dirs = [
+        #         ".venv", ".git", "__pycache__", "wandb", "checkpoints", "block_cache",
+        #         "official_configs", "official_results", "newckpt", "old_ch", "sol",
+        #         "dec1_checkpoints", "dec6_checkpoints", "dec6_backup", "current_valid"
+        #     ])
+        snapshot_code(
+            ckpt_dir,
+            root_dir=os.getcwd(),
+            include_top_level=["official_configs", "utils"],
+        )
         try:
             with open(os.path.join(ckpt_dir, "train_meta.json"), "w") as f:
                 json.dump(meta, f, indent=2)

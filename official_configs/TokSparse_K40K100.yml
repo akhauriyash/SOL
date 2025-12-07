@@ -7,7 +7,7 @@
   "reward_agg": "sum",
   "reward_gamma": 0.85,
 
-  "keep_fracs": [0.2, 1.0],
+  "keep_fracs": [0.4, 1.0],
   "struct_prune_choices": ["s100"],
   "quant_choices": ['q16'],
   "C_target": 0.5,
