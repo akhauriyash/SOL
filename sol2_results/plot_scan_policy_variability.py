@@ -82,11 +82,16 @@ def main():
         "tgt_keep_cli": "Target Token Sparsity",
     }
 
-    # Row 3: CLI target vs achieved token sparsity for each kind
+    # Row 3: CLI target vs achieved rate for each kind
     row3_x = {
-        "prune": "tgt_prune_keep_cli",
-        "quant": "tgt_quant_ratio_cli",
-        "toksparse": "tgt_keep_cli",
+        "prune": "tgt_prune_keep_cli",      # Target Prune Rate
+        "quant": "tgt_quant_ratio_cli",     # Target Quantization Ratio
+        "toksparse": "tgt_keep_cli",        # Target Token Sparsity
+    }
+    row3_y = {
+        "prune": "target_prune_keep",       # Achieved Prune Rate
+        "quant": "target_quant_ratio",      # Achieved Quantization Ratio
+        "toksparse": "target_keep_effective",  # Achieved Token Sparsity
     }
     # 3 rows x 3 columns:
     #   Row 1: achieved budgets vs ppl
@@ -132,19 +137,21 @@ def main():
 
         # ---------------- Row 3: target_keep_cli vs target_keep_effective ---------------- #
         x_col3 = row3_x[kind]
-        y_col3 = "target_keep_effective"
+        y_col3 = row3_y[kind]
         if x_col3 in df.columns and y_col3 in df.columns:
             df3 = df.dropna(subset=[x_col3, y_col3]).sort_values(x_col3)
         else:
             df3 = pd.DataFrame()
 
         ax3 = axes[2, col_idx]
+        x_label3 = cli_labels.get(x_col3, x_col3)
+        y_label3 = achieved_labels.get(y_col3, y_col3)
         if not df3.empty:
             ax3.plot(
                 df3[x_col3],
                 df3[y_col3],
                 marker="o",
-                label="Achieved Token Sparsity",
+                label=y_label3,
             )
         else:
             ax3.text(
