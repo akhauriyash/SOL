@@ -315,7 +315,8 @@ def main():
         toksparse_data, toksparse_policy, toksparse_fixed = load_random_and_policy_from_single_csv(toksparse_csv)
     # import pdb; pdb.set_trace()
     # ---------- Create 3 side-by-side subplots ----------
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharey=False)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharey=True)
+    # fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharey=False)
     make_violin_subplot(
         axes[0],
         quant_data,
