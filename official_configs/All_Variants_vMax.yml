@@ -1,0 +1,87 @@
+{
+  "model_name": "meta-llama/Llama-3.2-1B",
+
+  "algo": "grpo",
+  "sparsity_criteria": "quest",
+  "quest_page_size": 4,
+  "reward_agg": "sum",
+  "reward_gamma": 0.85,
+
+  "keep_fracs": [0.05, 0.2, 0.4, 0.6, 0.8, 1.0],
+  "struct_prune_choices": ["s40", "s45", "s50", "s55", "s60", "s65", "s70", "s75", "s80", "s85", "s90", "s95", "s100"],
+  "quant_choices": ['q5', 'q6', 'q7', 'q8', 'q9', 'q10', 'q11', 'q12', 'q13', 'q14', 'q15', 'q16'],
+  "C_target": 0.5,
+  "keep_target": 0.5,
+  "C_target_prune": 0.6,
+  "C_target_quant_bits": 7,
+  "enable_prune_quant": true,
+
+  "budget_tok_min": 0.1,
+  "budget_tok_max": 1.0,
+  
+  "budget_prune_min": 0.4,
+  "budget_prune_max": 1.00,
+
+  "budget_q_ratio_min": 0.3125,
+  "budget_q_ratio_max": 1.0,
+
+  "alpha_tok": 100.0,
+  "alpha_prune": 100.0,
+  "alpha_quant": 200.0,
+
+  "grpo_level": "process",
+  "task_w_kl": 0.0,
+  "horizon": 4,
+  "pi_temperature": 1.3,
+
+  "rollout_len": 16,
+  "entropy_coef": 0.05,
+  "context_len": 1024,
+  "batch_size": 8,
+  "grad_accum_steps": 8,
+  "lr": 1e-4,
+  "max_grad_norm": 2.0,
+  "Ts": 4,
+  "Tw": 2,
+
+  "epochs": 1,
+  "probe_metric": "lookahead_ce",
+  "future_mask_rule": "dense",
+  "eps_rel": 0.002,
+  "eps_acc": 0.002,
+  "grpo_rollouts_per_input": 32,
+  "grpo_norm": "center",
+  "adv_whiten_global": true,
+  "kl_pi_ref_coef": 0.0,
+
+  "tr_kl_coef": 0.0,
+
+  "ppo_clip": 0.2,
+  "ppo_epochs": 1,
+  "ppo_minibatch_size": 512,
+  "ppo_target_batch_size": 2048,
+  "value_coef": 0.3,
+  "gamma": 1.0,
+  "gae_lambda": 0.9,
+
+  "policy_d_model": 512,
+  "policy_n_heads": 4,
+  "policy_n_layers": 1,
+  "policy_mlp_ratio": 4.0,
+  "policy_action_dim": 32,
+  "policy_max_len": 1024,
+  "policy_dropout": 0.0,
+  "policy_tbptt_k": 0,
+
+  "dataset_name": "allenai/dolma",
+  "dataset_config": "v1_6-sample",
+  "text_field": "text",
+  "seed": 1234,
+  "dataset_pct": 100,
+  "max_blocks": null,
+
+  "eval_every_updates": 100,
+
+  "device": "cuda",
+  "dtype": "float32"
+}

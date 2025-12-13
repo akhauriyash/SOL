@@ -1491,7 +1491,7 @@ def main():
         if distributed and isinstance(dl.sampler, DistributedSampler):
             dl.sampler.set_epoch(epoch)
 
-        TRAIN_FRACTION = 0.2
+        TRAIN_FRACTION = 0.6
         max_batches = max(1, int(len(dl) * TRAIN_FRACTION))
         dl_epoch = limited_dl(dl, max_batches)
 

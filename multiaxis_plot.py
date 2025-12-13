@@ -231,8 +231,9 @@ def main():
     csv_files = [
         # ("allaxis_v1.csv", "All-axis v1"),
         ("allaxis_v2.csv", "All-axis Binary"),
-        ("allaxis_v3.csv", "All-axis Ternary"),
+        # ("allaxis_v3.csv", "All-axis Ternary"),
         # ("allaxis_v4.csv", "All-axis v4"),
+        ("allaxis_vmax_j.csv", "All-axis Multi"),
     ]
 
     # ---- Load data & build original 1x2 plot (unchanged behaviour) ----
@@ -314,9 +315,9 @@ def main():
                 x_rand_pareto, y_rand_pareto,
                 alpha=1.0, marker=".", color=COLORS["Random"], label="Random"
             )
-            if len(px_r) > 1:
-                ax.plot(px_r, py_r, linewidth=1.6, linestyle="-",
-                        label="_nolegend_", zorder=1000, color=COLORS["Random"])
+            # if len(px_r) > 1:
+            #     ax.plot(px_r, py_r, linewidth=1.6, linestyle="-",
+            #             label="_nolegend_", zorder=1000, color=COLORS["Random"])
 
         # ---- Policy ----
         if x_policy_scaled:
@@ -343,7 +344,8 @@ def main():
         ax.set_xlabel("Net Keep Rates")
 
     axes[0].set_ylabel("Perplexity")
-    axes[1].set_xlim(0.4, 0.6)
+    axes[1].set_xlim(0.5, 0.9)
+    axes[1].set_ylim(9.7, 11.2)
     axes[1].set_ylabel("Perplexity")
 
     if all_x and all_y:
