@@ -1,5 +1,5 @@
 {
-  "model_name": "meta-llama/Llama-3.2-1B",
+  "model_name": "meta-llama/Llama-3.2-3B",
 
   "algo": "grpo",
   "sparsity_criteria": "quest",
@@ -7,9 +7,9 @@
   "reward_agg": "sum",
   "reward_gamma": 0.85,
 
-  "keep_fracs": [0.1, 0.4, 0.8, 1.0],
-  "struct_prune_choices": ["s40", "s70", "s100"],
-  "quant_choices": ['q5', 'q8', 'q16'],
+  "keep_fracs": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+  "struct_prune_choices": ["s40", "s45", "s50", "s55", "s60", "s65", "s70", "s75", "s80", "s85", "s90", "s95", "s100"],
+  "quant_choices": ['q5', 'q6', 'q7', 'q8', 'q9', 'q10', 'q11', 'q12', 'q13', 'q14', 'q15', 'q16'],
   "C_target": 0.5,
   "keep_target": 0.5,
   "C_target_prune": 0.6,
@@ -36,9 +36,9 @@
 
   "rollout_len": 16,
   "entropy_coef": 0.05,
-  "context_len": 1024,
-  "batch_size": 8,
-  "grad_accum_steps": 8,
+  "context_len": 512,
+  "batch_size": 4,
+  "grad_accum_steps": 16,
   "lr": 1e-4,
   "max_grad_norm": 2.0,
   "Ts": 4,
@@ -69,7 +69,7 @@
   "policy_n_layers": 1,
   "policy_mlp_ratio": 4.0,
   "policy_action_dim": 32,
-  "policy_max_len": 1024,
+  "policy_max_len": 512,
   "policy_dropout": 0.0,
   "policy_tbptt_k": 0,
 

@@ -101,7 +101,7 @@ def train_one_epoch_grpo(tok,
                          meta: Optional[dict] = None):
     device = next(policy.parameters()).device
     is_main = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
-
+    policy_mod = unwrap(policy)
     if optimizer is None:
         optimizer = torch.optim.AdamW(unwrap(policy).parameters(), lr=cfg.lr, fused=True)
     policy.train()
@@ -336,7 +336,8 @@ def train_one_epoch_grpo(tok,
         cost_eff_sum = torch.tensor(0.0, device=device)
         eff_tok = torch.tensor(0.0, device=device)
         # Recurrent policy state (BK) & per-episode budget trackers
-        pi_state = policy.init_state(Bk, device=device)
+        # pi_state = policy.init_state(Bk, device=device)
+        pi_state = policy_mod.init_state(Bk, device=device)
         prev_action_ids = pi_state.last_action.clone()
         cum_keep   = torch.zeros(Bk, device=device)  # sum_t eff_t * kappa_t
         cum_eff    = torch.zeros(Bk, device=device)  # sum_t eff_t
@@ -404,14 +405,24 @@ def train_one_epoch_grpo(tok,
                 dim=-1,
             )
             h_prev_for_policy = state_pol.to(torch.float32)
-            logits, _value_unused, pi_state = policy.step(
-                # h_lm=state_pol.to(torch.float32),
-                h_lm=h_prev_for_policy,
-                e_tok=tok_embed.to(torch.float32),
-                scalars=scalars,
-                state=pi_state,
-                temperature=pi_temperature,
-            )
+            # logits, _value_unused, pi_state = policy.step(
+            #     # h_lm=state_pol.to(torch.float32),
+            #     h_lm=h_prev_for_policy,
+            #     e_tok=tok_embed.to(torch.float32),
+            #     scalars=scalars,
+            #     state=pi_state,
+            #     temperature=pi_temperature,
+            # )
+
+            # Rollout collection does not need gradients through the policy
+            with torch.no_grad():
+                logits, _value_unused, pi_state = policy_mod.step(
+                    h_lm=h_prev_for_policy,
+                    e_tok=tok_embed.to(torch.float32),
+                    scalars=scalars,
+                    state=pi_state,
+                    temperature=pi_temperature,
+                )
             dist_pi = torch.distributions.Categorical(logits=logits)
             action = dist_pi.sample()                      # [BK]
             logp_old = dist_pi.log_prob(action)            # [BK]
@@ -629,7 +640,8 @@ def train_one_epoch_grpo(tok,
         agg_cost_eff_sum += float(cost_eff_sum.item())
         agg_eff_tok  += float(eff_tok.item())
         if agg_count >= target_N:
-            if (run is not None) and (val_dl is not None) and (global_step_state["update"] % eval_every == 0):
+            # if (run is not None) and (val_dl is not None) and (global_step_state["update"] % eval_every == 0):
+            if (eval_every is not None) and (eval_every > 0) and (run is not None) and (val_dl is not None) and (global_step_state["update"] % eval_every == 0):
                 try:
                     # Allow eval_* to be missing or None; fall back to the training defaults.
                     _eval_C_tok   = getattr(cfg, "eval_C_tok", None)
@@ -743,14 +755,23 @@ def train_one_epoch_grpo(tok,
             num_mb = (Btot + mb_seqs - 1) // mb_seqs  # ceil
             for start in range(0, Btot, mb_seqs):
                 mb_idx = idx_seq[start:start+mb_seqs]
-                logits_seq, _values_unused = policy.forward_sequence(
-                    h_seq=h_total[:, mb_idx, :],
-                    e_seq=e_total[:, mb_idx, :],
-                    scalars_seq=scalars_total[:, mb_idx, :],
-                    prev_actions_seq=prev_actions_total[:, mb_idx],
+
+                logits_seq, values_seq = policy(
+                    h_total[:, mb_idx, :],
+                    e_total[:, mb_idx, :],
+                    scalars_total[:, mb_idx, :],
+                    prev_actions_total[:, mb_idx],
                     tbptt_k=tbptt_k,
                     temperature=pi_temperature,
                 )  # [T,Bmb,A], [T,Bmb]
+                # logits_seq, _values_unused = policy.forward_sequence(
+                #     h_seq=h_total[:, mb_idx, :],
+                #     e_seq=e_total[:, mb_idx, :],
+                #     scalars_seq=scalars_total[:, mb_idx, :],
+                #     prev_actions_seq=prev_actions_total[:, mb_idx],
+                #     tbptt_k=tbptt_k,
+                #     temperature=pi_temperature,
+                # )  # [T,Bmb,A], [T,Bmb]
                 dist_new = torch.distributions.Categorical(
                     logits=logits_seq.reshape(T*mb_idx.numel(), -1)
                 )
@@ -765,7 +786,12 @@ def train_one_epoch_grpo(tok,
                 policy_loss = -pg.mean()
 
                 entropy = dist_new.entropy().mean()
+
                 loss = policy_loss - entropy_coef * entropy
+                # Ensure critic params are "used" so grads are tensors (not None).
+                # 0.0 => no training signal, but avoids DDP+wandb grad=None issues.
+                loss = loss + 0.0 * values_seq.mean()
+                # loss = policy_loss - entropy_coef * entropy
                 ent_ratio = (entropy_coef * entropy).abs() / policy_loss.abs().clamp_min(1e-8)
                 if kl_pi_ref_coef > 0.0 and policy_ref is not None:
                     with torch.no_grad():
@@ -1191,8 +1217,11 @@ def train_one_epoch_sft(
             upd = int(global_step_state["update"])
             if (upd > 0) and (upd % eval_every == 0) and (upd != global_step_state.get("last_eval_update", -1)):
                 try:
+                    # sparse_stats = evaluate_stateful_policy_rollout(
+                    #     cfg, model, policy, val_dl,
+
                     sparse_stats = evaluate_stateful_policy_rollout(
-                        cfg, model, policy, val_dl,
+                        cfg, model, unwrap(policy), val_dl,
                         Ts=cfg.Ts, Tw=cfg.Tw, keep_fracs=cfg.keep_fracs,
                         context_len=cfg.context_len, rollout_len=cfg.rollout_len,
                         device=cfg.device, greedy=True, temperature=1.0,
@@ -1453,11 +1482,19 @@ def main():
             print(f"[load] Loaded policy weights from {args.checkpoint_path}")
 
     if distributed:
-        policy = DDP(policy, device_ids=[local_rank] if torch.cuda.is_available() else None,
-                     output_device=local_rank if torch.cuda.is_available() else None)
+        policy = DDP(
+            policy,
+            device_ids=[local_rank] if torch.cuda.is_available() else None,
+            output_device=local_rank if torch.cuda.is_available() else None,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+        )
+    # if distributed:
+    #     policy = DDP(policy, device_ids=[local_rank] if torch.cuda.is_available() else None,
+    #                  output_device=local_rank if torch.cuda.is_available() else None)
     if is_main:
         _watch_target = unwrap(policy)
-        wandb.watch(_watch_target, log="gradients", log_freq=500)
+        # wandb.watch(_watch_target, log="gradients", log_freq=500)
         wandb.config.update(
             {
                 "policy_num_params": sum(p.numel() for p in _watch_target.parameters()),
@@ -1491,14 +1528,14 @@ def main():
         if distributed and isinstance(dl.sampler, DistributedSampler):
             dl.sampler.set_epoch(epoch)
 
-        TRAIN_FRACTION = 0.6
+        TRAIN_FRACTION = 0.2
         max_batches = max(1, int(len(dl) * TRAIN_FRACTION))
         dl_epoch = limited_dl(dl, max_batches)
 
         if algo == "grpo":
             stats = train_one_epoch_grpo(
                 tok, model, policy, cfg, dl_epoch, epoch=epoch,
-                run=run, val_dl=val_dl, eval_every=cfg.eval_every_updates,
+                run=run, val_dl=val_dl, eval_every=-1,
                 global_step_state=global_step_state, optimizer=optimizer,
                 ckpt_dir=ckpt_dir, best_state=best_ckpt, meta=meta,
             )

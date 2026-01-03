@@ -319,3 +319,24 @@ class RecurrentActorCriticPolicy(nn.Module):
         values = self.v(h).squeeze(-1)               # [B,T]
 
         return logits.transpose(0, 1), values.transpose(0, 1)
+
+    # Make DDP happy: DDP only wraps/intercepts `forward()`.
+    # Route forward() to forward_sequence() so training can call `policy(...)`
+    # and get correct multi-GPU gradient synchronization.
+    def forward(
+        self,
+        h_seq: torch.Tensor,
+        e_seq: torch.Tensor,
+        scalars_seq: torch.Tensor,
+        prev_actions_seq: torch.Tensor,
+        tbptt_k: int = 0,
+        temperature: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_sequence(
+            h_seq=h_seq,
+            e_seq=e_seq,
+            scalars_seq=scalars_seq,
+            prev_actions_seq=prev_actions_seq,
+            tbptt_k=tbptt_k,
+            temperature=temperature,
+        )
