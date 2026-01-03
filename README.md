@@ -5,7 +5,7 @@
 Work on efficient Large Language Model (LLM) inference has emphasized how to make **every decoding step cheaper** (quantization, sparsity), but less so on **how much compute each token should receive**. This leaves deployments with a rigid, per-token budget that over-computes on easy tokens and under-computes on hard ones. We study \emph{dynamic budget allocation} for language models: learning how much compute to use for every generated token. Concretely, we train a small policy network ($0.5\%$ of the LLM size) that reads the LLM’s hidden state and selects a discrete action $\kappa \in \{\kappa_1,\dots,\kappa_A\}$ which controls the amount of compute allocated at every decode step. The base LLM weights are unchanged. This turns inference efficiency optimization into a sequential decision problem. We show that a learned policy can allocate dense context when it matters and sparse context when it does not. Further, our method can teach a policy to jointly optimize for quantization, sparsity and pruning. Self-Optimizing Language Models (SOL) consistently out-perform static budget-allocation strategies. SOL achieves a win-rate of 97.8\% over fixed-budget allocation, unlocking a complementary, underexplored dimension for efficiency optimization.
 
 ## Policy Models
-All policy models tested in our paper can be found on Google Drive as [SOL Models](https://drive.google.com/file/d/1MnKf02DR5nMx8CMnMqawaNyGR0fLkuxk/view?usp=sharing)
+All policy models tested in our paper as well as full csv of results + plotting code can be found on Google Drive as [SOL Model + Results](https://drive.google.com/file/d/1471okg2V8352uOwbIeqxtKi1nFgCRP4H/view?usp=sharing)
 
 
 ## Configuration
@@ -14,66 +14,78 @@ All run-time hyperparameters are defined in `utils/config.py` via the `Config` d
 Key config controllers:
 
 ```yaml
-model_name:                 meta-llama/Llama-3.2-1B
-"algo":                     "grpo",                   # grpo / sft
+model_name: meta-llama/Llama-3.2-1B
+algo: grpo                      # grpo | sft
 
-## Efficiency related knobs
-"sparsity_criteria":        "quest",                  # token-sparsity method (recency / relevancy / quest)
-"quest_page_size":          8,                        # page-size for quest token-sparsity
-"keep_fracs":               [0.2, 1.0],               # keep fractions for token sparsity (1.0: keep everything)
-"struct_prune_choices":     ['s100', 's80', 's60'],   # pruning choices (supports any number 1-100 as s{keep_rate})
-"quant_choices":            ['q4', 'q8', 'q16'],      # quantization choices (4/8/16 bit)
-"C_target":                 0.5,                      # token sparsity target (keep-rate)
-"C_target_prune":           0.70,                     # llm pruning target (keep-rate)
-"C_target_quant_bits":      9,                        # quantization target in bits
-"enable_prune_quant":       true,                     # enable pruning and quantization optimization
+## Efficiency / action space
+sparsity_criteria: quest         # recency | relevancy | quest
+quest_page_size: 8               # page size for QUEST (only used if sparsity_criteria=quest)
+relevancy_tier: per_head         # per_head | per_layer (only used if sparsity_criteria=relevancy)
 
-## RL reward related knobs
-"task_w_kl":                0.0,                      # 0.0 is LCE, 1.0 is DKL, can interpolate in between
-"reward_agg":               null,                     # set to sum for hybrid rewards
-"reward_gamma":             0.92,                     # controls the inverse-cumulative weight for hybrid reward
-"grpo_level":               "process",                # process / outcome / hybrid
+keep_fracs: [0.2, 1.0]           # token-attention keep fractions κ (1.0 = dense)
+struct_prune_choices:            # structured MLP prune actions: "s{keep%}" (e.g., s60 => keep 60%)
+  - s100
+  - s80
+  - s60
+quant_choices:                   # activation quant actions: "q{bits}" (e.g., q5..q16; q16 = dense)
+  - q8
+  - q16
+enable_prune_quant: true         # if false, prune/quant are held at dense settings
 
-# Lagrangian related
-lambda_lr_token:            float = 0.5
-lambda_lr_prune:            float = 0.5
-lambda_lr_quant:            float = 0.5
-lambda_init_token:          float = 25.0              # learning rate for lambda controller
-lambda_init_prune:          float = 25.0
-lambda_init_quant:          float = 25.0
+## Budget conditioning
+# Budgets are sampled per input sequence. For each axis, set either a discrete list
+# (budget_*_list) or a uniform range (budget_*_min/max). If unset, defaults below are used.
 
-# Others
-horizon: 4,                                           # look-ahead for greedy oracle (teacher)
-pi_temperature: 1.3,                                  # policy temperature
-Ts: int = 4                                           # number of "sinks tokens"
-Tw: int = 2                                           # dense sliding window
+budget_tok_list: null
+budget_tok_min: 0.1
+budget_tok_max: 1.0
 
+budget_prune_list: null
+budget_prune_min: 0.4
+budget_prune_max: 1.0
+
+budget_q_ratio_list: null
+budget_q_ratio_min: 0.3125       # 5/16
+budget_q_ratio_max: 1.0          # 16/16
+
+C_target: 0.5                    # default token keep target (alias: keep_target / C_target_token) used for eval
+C_target_prune: 0.70             # default prune keep target ρ used for eval
+C_target_quant_bits: 9.0         # default quant target in bits (internally uses q_ratio = bits/16) used for eval
+
+## Reward / GRPO
+task_w_kl: 0.0                   # 0.0 = log-likelihood; 1.0 = KL-to-dense baseline
+reward_agg: sum                  # null | sum | max
+reward_gamma: 0.85
+grpo_level: process              # process | outcome
+grpo_rollouts_per_input: 16      # K
+grpo_norm: center                # center | zscore
+adv_whiten_global: true
+
+## Episode + always-dense tokens
+rollout_len: 16                  # control horizon T
+context_len: 1024                # dense prefill length
+Ts: 4                            # sink tokens (always dense)
+Tw: 2                            # window tokens (always dense)
+pi_temperature: 1.3              # rollout sampling temperature
 ```
-
-Multi-GPU is not yet supported. All our tests are run on a single Nvidia A6000 GPU.
 
 ## Training
 
-Several example scripts are provided in `scripts.sh`. Launch training with `torchrun` (or `python`) once a config file is prepared:
+Example scripts are provided in `scripts.sh`. Single training example
 ```bash
-torchrun --nproc_per_node=1 --master_port 29510 train.py      \
-  --wandb_project SOL                                         \
-  --wandb_run_name RL_LCE_Quest4                              \
-  --config <base_path>/SOL/official_configs/RL_LCE_Quest4.yml
+CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port 29513 train.py   \
+  --wandb_project SOL_RLS_MSC     --wandb_run_name Llama8Bi                       \
+   --config < path to config >/official_configs/All_Variants_Llama8Bi.yml
 ```
 
 ## Evaluation
 
-To evaluate on perplexity metrics, use
-```
-python test_ckpt.py --ckpt_dir <base_path>/SOL/checkpoints/RL_LCE_Quest4-20251028-213126 \
-  --mode "latest" --dataset_name wikitext --sparsity_bias 0.0 --prune_bias 0.0 --quant_bias 0.0
-```
+To evaluate on perplexity metrics, refer to `eval_script.sh`. It automatically executes random and fixed baselines.
 
 To evaluate on downstream tasks, run:
 
 ```
-python eval_policy_lmeval.py   --ckpt_dir <base_path>/SOL/checkpoints/RL_LCE_Quest8_PruneQuant-20251030-202125  \
+python eval_policy_lmeval.py   --ckpt_dir <base_path>/SOL/checkpoints/Llama8Bi-20260102-163733  \
   --mode latest   --tasks hellaswag,squadv2,arc_easy,winogrande   --batch_size 8  \
   --episode_len 16 --sparsity_bias 0.0 --quant_bias 0.0 --prune_bias 0.0          \
   --greedy_policy --fixed_from_policy --export_sparsity_json base_path.json
