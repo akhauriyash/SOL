@@ -540,21 +540,39 @@ def _expand_to_batch(values: torch.Tensor, batch_size: int) -> torch.Tensor:
     reps = (batch_size + flat.numel() - 1) // flat.numel()
     return flat.repeat(reps)[:batch_size]
 
-
 def _fake_quantize_bits(x: torch.Tensor, bits: int) -> torch.Tensor:
-    """Symmetric per-sample uniform fake quantization; bits >= 16 is identity."""
     if bits >= 16:
         return x
+
+    x_f = x.to(torch.float32)
     qmax = (1 << (bits - 1)) - 1
-    # Per-sample (batch, seq) scaling on the last dim
-    # x: [B, T, D] or [B, D] -> normalize along D
-    if x.dim() == 3:
-        ax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    if x_f.dim() == 3:
+        ax = x_f.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
     else:
-        ax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+        ax = x_f.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+
     scale = ax / float(qmax)
-    xq = torch.round(x / scale).clamp_(-qmax, qmax) * scale
-    return xq
+    x_int = torch.round(x_f / scale).clamp_(-qmax, qmax)
+    x_q = x_int * scale
+
+    return x_q.to(x.dtype)
+
+# # Removing this makes ppl go from 39.540 to 37.505 (replaced with fp32 calc)
+# def _fake_quantize_bits(x: torch.Tensor, bits: int) -> torch.Tensor:
+#     """Symmetric per-sample uniform fake quantization; bits >= 16 is identity."""
+#     if bits >= 16:
+#         return x
+#     qmax = (1 << (bits - 1)) - 1
+#     # Per-sample (batch, seq) scaling on the last dim
+#     # x: [B, T, D] or [B, D] -> normalize along D
+#     if x.dim() == 3:
+#         ax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+#     else:
+#         ax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+#     scale = ax / float(qmax)
+#     xq = torch.round(x / scale).clamp_(-qmax, qmax) * scale
+#     return xq
 
 
 def _fake_quantize_batched(x: torch.Tensor, bits_vec: torch.Tensor) -> torch.Tensor:
@@ -616,25 +634,25 @@ def enable_structured_controls(model, *, apply_to_attention_input: bool = True) 
     # Patch MLP once
     if not hasattr(llama_mod, "_struct_prev_mlp_forward"):
         orig_mlp_forward = llama_mod.LlamaMLP.forward
+        
         def mlp_forward_with_struct(module, hidden_states, *args, **kwargs):
             # 1) Optional pruning on MLP input ONLY (doesn't touch attention)
             keep = getattr(module, "_struct_prune_keep", None)
             if keep is not None:
                 hidden_states = _apply_channel_prune(hidden_states, keep)
 
-            # 2) Optional quantization (your existing logic)
+            # 2) Optional quantization: now applied ONLY to the MLP output
             bits = getattr(module, "_struct_quant_bits", None)
             if bits is None:
+                # No quantization -> just run the original MLP
                 return orig_mlp_forward(module, hidden_states, *args, **kwargs)
 
-            x_q = _fake_quantize_batched(hidden_states, bits)
-            gate = module.gate_proj(x_q)
-            up   = module.up_proj(x_q)
-            act  = module.act_fn(gate)
-            fused = act * up
-            fused_q = _fake_quantize_batched(fused, bits)
-            out = module.down_proj(fused_q)
-            return out
+            # Run the original MLP in full precision
+            out = orig_mlp_forward(module, hidden_states, *args, **kwargs)
+
+            # Fake-quantize the MLP *output* (residual stream)
+            out_q = _fake_quantize_batched(out, bits)
+            return out_q
 
         llama_mod._struct_prev_mlp_forward = orig_mlp_forward
         llama_mod.LlamaMLP.forward = mlp_forward_with_struct

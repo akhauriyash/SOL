@@ -62,9 +62,9 @@ def evaluate_stateful_policy_rollout(
     device,
     greedy: bool = True,
     temperature: float = 1.0,
-    lambda_keep: float = 0.0,
-    lambda_prune: float = 0.0,
-    lambda_quant: float = 0.0,
+    target_C_tok: Optional[float] = None,
+    target_C_pru: Optional[float] = None,
+    target_C_qbits: Optional[float] = None,
     sparsity_bias: float = 0.0,
     prune_bias: float = 0.0,
     quant_bias: float = 0.0,
@@ -76,7 +76,7 @@ def evaluate_stateful_policy_rollout(
     Differences vs the stateless evaluator:
       - Uses policy.init_state(B, device) and policy.step(..., state).
       - Feeds the same 8D scalar vector as training:
-            [t_frac, eff_flag, lambda_keep, lambda_prune, lambda_quant,
+            [t_frac, eff_flag, C_tok_target, C_pru_target, C_qratio_target,
              dev_keep, dev_prune, dev_qratio]
       - Keeps LM frozen; all LM-derived features are detached.
     """
@@ -108,14 +108,22 @@ def evaluate_stateful_policy_rollout(
     P_MAX = float(max(spec.prune_keep)) if len(spec.prune_keep) > 0 else 1.0
 
     thr = Ts + Tw + 1
-    # Match training precedence for targets/tolerances
-    C_tok   = float(getattr(cfg, "C_target_token", getattr(cfg, "C_target", getattr(cfg, "keep_target", 1.0))))
-    tol_tok = float(getattr(cfg, "tol_token", getattr(cfg, "budget_tolerance", getattr(cfg, "keep_tolerance", 0.01))))
-    C_pru   = float(getattr(cfg, "C_target_prune", 0.70))
-    tol_pru = float(getattr(cfg, "tol_prune", 0.05))
-    C_qbits = float(getattr(cfg, "C_target_quant_bits", 8.0))
+    # Default evaluation budgets; can be overridden by explicit targets.
+    C_tok_default   = float(getattr(cfg, "C_target_token", getattr(cfg, "C_target", getattr(cfg, "keep_target", 1.0))))
+    C_pru_default   = float(getattr(cfg, "C_target_prune", 0.70))
+    C_qbits_default = float(getattr(cfg, "C_target_quant_bits", 8.0))
+
+    if target_C_tok is None:
+        target_C_tok = C_tok_default
+    if target_C_pru is None:
+        target_C_pru = C_pru_default
+    if target_C_qbits is None:
+        target_C_qbits = C_qbits_default
+
+    C_tok   = float(target_C_tok)
+    C_pru   = float(target_C_pru)
+    C_qbits = float(target_C_qbits)
     C_q     = C_qbits / 16.0
-    tol_q   = float(getattr(cfg, "tol_quant_bits", 1.0)) / 16.0
  
     # index for "dense" κ to force on non-effective steps (matches teacher)
     # dense_idx = keep_fracs.index(1.0) if 1.0 in keep_fracs else int(torch.argmax(KEEP).item())
@@ -198,14 +206,14 @@ def evaluate_stateful_policy_rollout(
             tok_embed = emb_layer(cur).detach()                              # [B, E]
 
             # === 8D scalar feature vector (must match training) ===
-            # 0: t_frac        in [0,1]
-            # 1: eff_flag      in {0,1}
-            # 2: lambda_keep
-            # 3: lambda_prune
-            # 4: lambda_quant
-            # 5: dev_keep      = mean_keep_prev   - C_tok
-            # 6: dev_prune     = mean_prune_prev  - C_pru
-            # 7: dev_qratio    = mean_qratio_prev - C_q
+            # 0: t_frac         in [0,1]
+            # 1: eff_flag       in {0,1}
+            # 2: C_tok_target   in [0,1]
+            # 3: C_pru_target   in [0,1]
+            # 4: C_qratio_target in [0,1]  (bits/16)
+            # 5: dev_keep       = mean_keep_prev   - C_tok
+            # 6: dev_prune      = mean_prune_prev  - C_pru
+            # 7: dev_qratio     = mean_qratio_prev - C_q
             t_frac = torch.full(
                 (B, 1),
                 (t + 1) / float(rollout_len),
@@ -213,10 +221,6 @@ def evaluate_stateful_policy_rollout(
                 dtype=torch.float32,
             )
             eff_flag = eff_mask.float().unsqueeze(1)
-
-            lambda_keep_now  = torch.full_like(t_frac, float(lambda_keep))
-            lambda_prune_now = torch.full_like(t_frac, float(lambda_prune))
-            lambda_quant_now = torch.full_like(t_frac, float(lambda_quant))
 
             mean_keep_prev = torch.where(
                 cum_eff > 0,
@@ -242,9 +246,9 @@ def evaluate_stateful_policy_rollout(
                 [
                     t_frac,
                     eff_flag,
-                    lambda_keep_now,
-                    lambda_prune_now,
-                    lambda_quant_now,
+                    torch.full_like(t_frac, C_tok),
+                    torch.full_like(t_frac, C_pru),
+                    torch.full_like(t_frac, C_q),
                     dev_keep.unsqueeze(1),
                     dev_prune.unsqueeze(1),
                     dev_qratio.unsqueeze(1),
@@ -286,79 +290,38 @@ def evaluate_stateful_policy_rollout(
             # Histogram should also reflect the effective action:
             action_hist.index_add_(0, a_eff, torch.ones_like(a_eff, dtype=torch.float32))
 
-            # ---- Group by (prune, quant) to set model-global controls per forward ----
-            # Build grouping keys; use float for uniqueness (bits cast to float)
-            pq = torch.stack([prune_now, qbits_now.to(torch.float32)], dim=-1)  # [B, 2]
-            uniq, inv = torch.unique(pq, dim=0, return_inverse=True)
+            # ---- Batched sparse forward, same pattern as training ----
+            set_structured_action(model, prune_now, qbits_now)
 
-            logits_step = None
-            new_state = torch.empty_like(state_lm)
-            # new_cache = past_kv
-            new_cache = None 
-            pos_ids_all = (kv_len - 1).clamp_min(0).unsqueeze(1)
+            pos_ids = (kv_len - 1).clamp_min(0).unsqueeze(1)
+            bias = build_sparse_attention_bias(
+                model=model,
+                past_kv_lens=kv_len,
+                keep_fracs=kappa_now,
+                Ts=Ts,
+                Tw=Tw,
+                device=device,
+                dtype=m_dtype,
+                criteria=getattr(cfg, "sparsity_criteria", "recency"),
+                tier=getattr(cfg, "relevancy_tier", "per_head"),
+            )
 
-            # helper to allocate an expanded cache with batch=B using subgroup shapes
-            def _init_cache_container_like(sub_cache, B_total: int):
-                container = []
-                for (k_src, v_src) in sub_cache:
-                    k_shape = list(k_src.shape); k_shape[0] = B_total
-                    v_shape = list(v_src.shape); v_shape[0] = B_total
-                    container.append((
-                        torch.empty(k_shape, dtype=k_src.dtype, device=k_src.device),
-                        torch.empty(v_shape, dtype=v_src.dtype, device=v_src.device),
-                    ))
-                return tuple(container)
+            out_step = model(
+                input_ids=cur.unsqueeze(1),
+                use_cache=True,
+                past_key_values=past_kv,
+                position_ids=pos_ids,
+                attention_mask=bias,
+                return_dict=True,
+                output_hidden_states=True,
+            )
 
-            for g, (p_val, q_val) in enumerate(uniq.tolist()):
-                sel = (inv == g).nonzero(as_tuple=False).squeeze(-1)  # [Bg]
-                if sel.numel() == 0:
-                    continue
-                p_scalar = float(p_val)
-                q_scalar = int(q_val)
-                set_structured_action(model, p_scalar, q_scalar)
-
-                cur_g      = cur.index_select(0, sel)
-                pos_ids_g  = pos_ids_all.index_select(0, sel)
-                kappa_g    = kappa_now.index_select(0, sel)
-                bias_g = build_sparse_attention_bias(
-                    model=model,
-                    past_kv_lens=kv_len.index_select(0, sel),
-                    keep_fracs=kappa_g,
-                    Ts=Ts, Tw=Tw,
-                    device=device, dtype=m_dtype,
-                    criteria=getattr(cfg, "sparsity_criteria", "recency"),
-                    tier=getattr(cfg, "relevancy_tier", "per_head"),
-                )
-                cache_g = select_cache_by_indices(past_kv, sel)
-                out_g = model(
-                    input_ids=cur_g.unsqueeze(1),
-                    use_cache=True,
-                    past_key_values=cache_g,
-                    position_ids=pos_ids_g,
-                    attention_mask=bias_g,
-                    return_dict=True,
-                    output_hidden_states=True,
-                )
-                if logits_step is None:
-                    logits_step = torch.empty(
-                        (B, out_g.logits.size(-1)), device=device, dtype=out_g.logits.dtype
-                    )
-                logits_step.index_copy_(0, sel, out_g.logits[:, -1, :])
-                if new_cache is None:
-                    new_cache = _init_cache_container_like(out_g.past_key_values, B)
-                # Merge subgroup caches into expanded destination along batch dim
-                for li, (k_src, v_src) in enumerate(out_g.past_key_values):
-                    k_dst, v_dst = new_cache[li]
-                    k_dst.index_copy_(0, sel, k_src)  # src has L+1; dst already L+1
-                    v_dst.index_copy_(0, sel, v_src)
-                kv_len.index_add_(0, sel, torch.ones_like(sel, device=device, dtype=kv_len.dtype))
-                new_state.index_copy_(0, sel, out_g.hidden_states[-1][:, -1, :].detach())
+            logits_step = out_step.logits[:, -1, :]
+            past_kv = out_step.past_key_values
+            kv_len = kv_len + 1
+            state_lm = out_step.hidden_states[-1][:, -1, :].detach()
 
             clear_structured_action(model)
-
-            assert new_cache is not None, "new_cache must be allocated in subgroup loop"
-            past_kv = new_cache
-            state_lm = new_state
             # NLL for perplexity
             nll_t = F.cross_entropy(logits_step, labels_t, reduction="none")
             total_nll += nll_t.sum().item()
@@ -607,7 +570,6 @@ def evaluate_sft_teacher_matched_keep(
             # Required keep to finish on target (clipped to [kappa_min, kappa_max])
             c_req = (target_keep_effective * (cum_eff + R) - cum_keep) / torch.clamp(R, min=1.0)
             c_req = torch.clamp(c_req, kappa_min, kappa_max)  # [B]
-
             if eff_mask.any():
                 # Probe lookahead losses for all actions (dense_kl or CE) on the (still) full batch
                 losses_a = probe_losses_with_lookahead(
@@ -619,8 +581,10 @@ def evaluate_sft_teacher_matched_keep(
                     step_labels=step_labels,
                     t=t,
                     keep_fracs=keep_fracs,
-                    Ts=Ts, Tw=Tw,
-                    device=device, dtype=model.dtype,
+                    Ts=Ts,
+                    Tw=Tw,
+                    device=device,
+                    dtype=model.dtype,
                     horizon=getattr(cfg, "horizon", 1),
                     future_mask_rule=getattr(cfg, "future_mask_rule", "dense"),
                     metric=getattr(cfg, "probe_metric", "dense_kl"),
@@ -631,19 +595,26 @@ def evaluate_sft_teacher_matched_keep(
                 # Score with per-sequence steering: loss + beta * (kappa - c_req)^2
                 # Broadcast: c_req[:,None] vs KEEP[None,:]
                 steer_pen = (KEEP.view(1, -1) - c_req.view(-1, 1)) ** 2  # [B,A]
-                scores = losses_a + beta * steer_pen
+                scores = losses_a + beta * steer_pen                     # [B,A]
 
                 # Choose argmin per sequence, but only for those effective now
                 idx_eff = torch.nonzero(eff_mask, as_tuple=False).squeeze(-1)
                 a_star[idx_eff] = torch.argmin(scores[idx_eff, :], dim=-1)
 
+                # Score margin (2nd best − best) for logging; robust when A == 1.
                 with torch.no_grad():
-                    sorted_scores, _ = torch.sort(scores, dim=-1)
-                    score_margin_all = (sorted_scores[:, 1] - sorted_scores[:, 0]).detach()
+                    sorted_scores, _ = torch.sort(scores, dim=-1)  # [B, A]
+                    if sorted_scores.size(1) >= 2:
+                        best = sorted_scores[:, 0]
+                        second = sorted_scores[:, 1]
+                        score_margin_all = (second - best).detach()
+                    else:
+                        # Only a single keep option; define margin as zero.
+                        score_margin_all = torch.zeros(B, device=device)
+
                     m_t = torch.full((B,), float('nan'), device=device)
                     m_t[eff_mask] = score_margin_all[eff_mask]
                     margins_seq_buf.append(m_t)
-
             # ---------- Build soft teacher over actions for step t ----------
             if collect_policy_tensors:
                 soft_t = torch.zeros(B, A, device=device, dtype=torch.float32)

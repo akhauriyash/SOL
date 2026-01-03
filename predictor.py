@@ -117,12 +117,12 @@ class RecurrentActorCriticPolicy(nn.Module):
       - scalars  : 8D vector with:
             [0] t_frac            \in [0,1]
             [1] eff_flag          \in {0,1}
-            [2] lambda_keep
-            [3] lambda_prune
-            [4] lambda_quant
-            [5] dev_keep          = mean_keep_prev   - C_tok
-            [6] dev_prune         = mean_prune_prev  - C_pru
-            [7] dev_qratio        = mean_qratio_prev - C_q
+            [2] C_tok_target      \in [0,1]
+            [3] C_pru_target      \in [0,1]
+            [4] C_qratio_target   \in [0,1]  (bits/16)
+            [5] dev_keep          = mean_keep_prev   - C_tok_target
+            [6] dev_prune         = mean_prune_prev  - C_pru_target
+            [7] dev_qratio        = mean_qratio_prev - C_qratio_target
       - a_{t-1}  : previous action id                          [B]
     """
     def __init__(
@@ -142,10 +142,12 @@ class RecurrentActorCriticPolicy(nn.Module):
         super().__init__()
         self.n_actions = n_actions
         self.scalar_dim = scalar_dim
-        # We only *use* a subset of the scalar features internally:
-        #   [0] t_frac, [1] eff_flag, [5] dev_keep, [6] dev_prune, [7] dev_qratio
-        # Lambdas [2:5] are ignored here, so callers can keep passing the original 8D vector.
-        kept_scalar_idx = [i for i in (0, 1, 5, 6, 7) if i < scalar_dim]
+        # We condition on:
+        #   [0] t_frac, [1] eff_flag,
+        #   [2] C_tok_target, [3] C_pru_target, [4] C_qratio_target,
+        #   [5] dev_keep, [6] dev_prune, [7] dev_qratio.
+        # If scalar_dim > 8 we drop extras; if < 8 we use the prefix.
+        kept_scalar_idx = list(range(min(8, scalar_dim)))
         self.register_buffer(
             "scalar_keep_idx",
             torch.tensor(kept_scalar_idx, dtype=torch.long),
@@ -169,6 +171,14 @@ class RecurrentActorCriticPolicy(nn.Module):
             self.obs_proj = nn.Linear(in_dim, d_model)
         else:
             self.scalar_proj = nn.Identity()
+
+        # Dedicated head that maps budgets [C_tok, C_pru, C_qratio]
+        # directly into action-logit offsets.
+        self.budget_head = nn.Sequential(
+            nn.Linear(3, 32),
+            nn.GELU(),
+            nn.Linear(32, n_actions),
+        )
         self.pos_emb = nn.Embedding(max_len, d_model)              # learned absolute positions
         self.blocks = nn.ModuleList([_TransformerBlock(d_model, n_heads, mlp_ratio, dropout) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
@@ -206,14 +216,19 @@ class RecurrentActorCriticPolicy(nn.Module):
         temperature: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, PolicyState]:
         B = h_lm.size(0)
-        # Drop lambda_* dimensions inside the policy; keep only
-        # t_frac, eff_flag, dev_keep, dev_prune, dev_qratio.
+        # Keep the first up‑to‑8 structured scalar features
+        # [t_frac, eff_flag, C_tok, C_pru, C_q, dev_keep, dev_prune, dev_qratio].
+
         if self.scalar_keep_idx is not None:
             scalars_used = torch.index_select(
                 scalars, dim=-1, index=self.scalar_keep_idx.to(scalars.device)
             )
         else:
             scalars_used = scalars
+
+        # Extract budgets: [C_tok, C_pru, C_qratio] from scalar slots [2:5].
+        # Shape: [B, 3]
+        budgets = scalars_used[:, 2:5]
         x = self._form_step_inputs(
             h_lm,
             e_tok,
@@ -232,7 +247,10 @@ class RecurrentActorCriticPolicy(nn.Module):
             new_v.append(pv)
         h = self.ln_f(h)                        # [B,1,D]
         h_last = h.squeeze(1)                   # [B,D]
-        logits = self.pi(h_last) / max(1e-6, temperature)
+
+        logits_base = self.pi(h_last)           # [B, A]
+        budget_logits = self.budget_head(budgets)  # [B, A]
+        logits = (logits_base + budget_logits) / max(1e-6, temperature)
         value  = self.v(h_last).squeeze(-1)     # [B]
         next_state = PolicyState(past_k=new_k, past_v=new_v, step_idx=state.step_idx + 1, last_action=state.last_action)
         return logits, value, next_state
@@ -260,13 +278,17 @@ class RecurrentActorCriticPolicy(nn.Module):
         T, B, _ = h_seq.shape
         device = h_seq.device
         pos = self._positions(T, B, device)  # [T,B]
-        # Same scalar subset as in step(): drop the lambda_* entries.
+        # Same scalar subset as in step(): keep the first up‑to‑8 features.
+
         if self.scalar_keep_idx is not None:
             scalars_used = torch.index_select(
                 scalars_seq, dim=-1, index=self.scalar_keep_idx.to(scalars_seq.device)
             )
         else:
             scalars_used = scalars_seq
+
+        # budgets: [T,B,3]
+        budgets = scalars_used[..., 2:5]
 
         x = torch.cat(
             [
@@ -285,7 +307,36 @@ class RecurrentActorCriticPolicy(nn.Module):
             h, _, _ = block(h, past_k=None, past_v=None, use_cache=False)
         h = self.ln_f(h)                             # [B,T,D_model]
 
-        logits = self.pi(h) / max(1e-6, temperature) # [B,T,A]
+        logits_base = self.pi(h)                     # [B,T,A]
+
+        # Flatten budgets for budget_head: [T*B, 3] -> [T*B, A] -> [T,B,A]
+        TB = T * B
+        budgets_flat = budgets.reshape(TB, 3)
+        budget_logits_flat = self.budget_head(budgets_flat)      # [TB, A]
+        budget_logits = budget_logits_flat.view(T, B, -1).transpose(0, 1)  # [B,T,A]
+
+        logits = (logits_base + budget_logits) / max(1e-6, temperature)
         values = self.v(h).squeeze(-1)               # [B,T]
 
         return logits.transpose(0, 1), values.transpose(0, 1)
+
+    # Make DDP happy: DDP only wraps/intercepts `forward()`.
+    # Route forward() to forward_sequence() so training can call `policy(...)`
+    # and get correct multi-GPU gradient synchronization.
+    def forward(
+        self,
+        h_seq: torch.Tensor,
+        e_seq: torch.Tensor,
+        scalars_seq: torch.Tensor,
+        prev_actions_seq: torch.Tensor,
+        tbptt_k: int = 0,
+        temperature: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_sequence(
+            h_seq=h_seq,
+            e_seq=e_seq,
+            scalars_seq=scalars_seq,
+            prev_actions_seq=prev_actions_seq,
+            tbptt_k=tbptt_k,
+            temperature=temperature,
+        )
