@@ -206,13 +206,25 @@ def main():
     p.add_argument("--episode_len", type=int, default=None, help="Override episode length (default cfg.rollout_len)")
     p.add_argument("--dense_refresh_tail", type=int, default=None, help="Tail tokens to dense-prefill between episodes (default Ts+Tw+1)")
     p.add_argument("--policy_temperature", type=float, default=0.6)
-    p.add_argument("--greedy_policy", action="store_true", help="Use argmax over κ actions (default True)")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--greedy_policy", dest="greedy_policy", action="store_true",
+                   help="Use argmax over policy actions (default).")
+    g.add_argument("--stochastic_policy", dest="greedy_policy", action="store_false",
+                   help="Sample policy actions (stochastic).")
+    p.set_defaults(greedy_policy=True)
     p.add_argument("--dense_baseline", action="store_true", help="Also run dense baseline (no policy, no sparse masks)")
     p.add_argument("--export_sparsity_json", type=str, default=None,
                    help="If set, write per-request sparsity stats to this JSON file")
     p.add_argument("--sparsity_bias", type=float, default=0.0, help=">0 favors sparser keep_fracs; <0 favors denser")
     p.add_argument("--prune_bias", type=float, default=0.0, help=">0 favors more structural pruning (lower keep after pruning)")
     p.add_argument("--quant_bias", type=float, default=0.0, help=">0 favors lower-bit quantization")
+    p.add_argument("--tgt_keep", type=float, default=None,
+                   help="Override target token keep C_tok in [0,1] for policy eval.")
+    p.add_argument("--tgt_prune_keep", type=float, default=None,
+                   help="Override target prune keep C_pru in [0,1] for policy eval.")
+    p.add_argument("--tgt_quant_bits", type=float, default=None,
+                   help="Override target quant bits (e.g. 8, 16) for policy eval.")
+
     p.add_argument("--fixed_baseline_reference", type=str, default=None,
                    help="Path to (or sibling of) a key_metrics_*.json file from a previous run. "
                         "Will parse bias kind/value from the filename and use the matching "
@@ -221,6 +233,18 @@ def main():
     p.add_argument("--fixed_from_policy", action="store_true",
                    help="After running the policy, run a FixedHarnessLM that targets the policy's observed averages (token_keep/prune_keep/quant_ratio).")
     args = p.parse_args()
+
+    # Validate explicit targets if provided
+    def _check01(name: str, v: Optional[float]):
+        if v is None:
+            return
+        if not (0.0 <= float(v) <= 1.0):
+            raise ValueError(f"{name} must be in [0,1], got {v}")
+
+    _check01("--tgt_keep", args.tgt_keep)
+    _check01("--tgt_prune_keep", args.tgt_prune_keep)
+    if args.tgt_quant_bits is not None and float(args.tgt_quant_bits) <= 0:
+        raise ValueError(f"--tgt_quant_bits must be > 0, got {args.tgt_quant_bits}")
 
     # If a reference for fixed baseline is provided, run fixed-only path and exit.
     if args.fixed_baseline_reference:
@@ -302,6 +326,9 @@ def main():
         sparsity_bias=args.sparsity_bias,
         prune_bias=args.prune_bias,
         quant_bias=args.quant_bias,
+        target_C_tok=args.tgt_keep,
+        target_C_pru=args.tgt_prune_keep,
+        target_C_qbits=args.tgt_quant_bits,
         dense_only=False,
         max_batch=args.batch_size,
     )
@@ -385,6 +412,9 @@ def main():
         sparsity_bias=args.sparsity_bias,
         prune_bias=args.prune_bias,
         quant_bias=args.quant_bias,
+        target_C_tok=args.tgt_keep,
+        target_C_pru=args.tgt_prune_keep,
+        target_C_qbits=args.tgt_quant_bits,
         dense_only=True,
         max_batch=args.batch_size,
     )

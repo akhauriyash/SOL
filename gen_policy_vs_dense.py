@@ -173,6 +173,9 @@ def main():
     p.add_argument("--prune_bias", type=float, default=0,
                         help="Positive values bias the policy toward more pruning during eval.")
 
+    p.add_argument("--tgt_keep", type=float, default=None, help="Override target token keep rate C_tok in [0,1].")
+    p.add_argument("--tgt_prune_keep", type=float, default=None, help="Override target prune keep C_pru in [0,1].")
+    p.add_argument("--tgt_quant_bits", type=float, default=None, help="Override target quant bits (e.g. 8, 16).")
     args = p.parse_args()
     set_seed(args.seed)
 
@@ -188,6 +191,9 @@ def main():
         sparsity_bias=args.sparsity_bias,
         prune_bias=args.prune_bias,
         quant_bias=args.quant_bias,
+        target_C_tok=args.tgt_keep,
+        target_C_pru=args.tgt_prune_keep,
+        target_C_qbits=args.tgt_quant_bits,
     )
 
     dense_model = PolicyHarnessLM(

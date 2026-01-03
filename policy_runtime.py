@@ -3,9 +3,9 @@ import os
 import json
 import argparse
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Iterable
+from typing import List, Tuple, Optional, Iterable, Any
 import math
-
+import warnings
 import torch
 import torch.nn.functional as F
 from torch.distributions import Categorical
@@ -13,7 +13,14 @@ from torch.distributions import Categorical
 from utils.config import Config
 from utils.model import load_lm_and_tokenizer, unwrap
 from utils.masks import (
-    build_sparse_attention_bias, enable_structured_controls, set_structured_action, clear_structured_action, clear_quest_token_budgets, clear_relevancy_keep
+    build_sparse_attention_bias,
+    enable_structured_controls,
+    enable_quest_attention,
+    enable_relevancy_attention,
+    set_structured_action,
+    clear_structured_action,
+    clear_quest_token_budgets,
+    clear_relevancy_keep,
 )
 from predictor import RecurrentActorCriticPolicy
 from utils.actions import build_action_spec
@@ -32,7 +39,7 @@ class PolicyRuntimeState:
     cum_eff: torch.Tensor     # [B]
     cum_prune: torch.Tensor   # [B]  (normalized prune keep)
     cum_qratio: torch.Tensor  # [B]  (bits/16)
-    pi_state: any             # PolicyState
+    pi_state: any             # predictor.PolicyState
 
 
 def endswith_seq(seq_ids, suffix_ids):
@@ -71,12 +78,19 @@ class FixedLMRunner:
         self.device = cfg.device
         self.dtype = next(self.m.parameters()).dtype if any(p.requires_grad for p in self.m.parameters()) else cfg.dtype
 
+        self.criteria = str(getattr(cfg, "sparsity_criteria", "recency")).lower()
+        self.tier = str(getattr(cfg, "relevancy_tier", "per_head"))
+
+        if self.criteria == "quest":
+            page = int(getattr(cfg, "quest_page_size", 16))
+            enable_quest_attention(self.m, page_size=page)
+        elif self.criteria == "relevancy":
+            enable_relevancy_attention(self.m, tier=self.tier, cfg=cfg)
+        elif self.criteria != "recency":
+            raise ValueError(f"Unknown sparsity_criteria: {self.criteria}")
         self.Ts = int(getattr(cfg, "Ts", 0))
         self.Tw = int(getattr(cfg, "Tw", 0))
         self.thr = self.Ts + self.Tw + 1
-        self.P_MAX = float(max(spec.prune_keep)) if len(spec.prune_keep) > 0 else 1.0
-        self.criteria = str(getattr(cfg, "sparsity_criteria", "recency"))
-        self.tier = str(getattr(cfg, "relevancy_tier", "per_head"))
 
         spec = build_action_spec(
             keep_fracs=cfg.keep_fracs,
@@ -84,6 +98,7 @@ class FixedLMRunner:
             quant_choices=getattr(cfg, "quant_choices", ("q16",)),
         )
         self.spec = spec
+        self.P_MAX = float(max(spec.prune_keep)) if len(spec.prune_keep) > 0 else 1.0
         enable_structured_controls(self.m)
 
         def _uniq_in_order(seq):
@@ -167,7 +182,7 @@ class FixedLMRunner:
             output_hidden_states=True,
         )
         past_kv = out.past_key_values
-        kv_len  = torch.full((1,), ids.size(1), device=self.device, dtype=torch.long)
+        kv_len  = torch.full((1,), ids.size(1) + 1, device=self.device, dtype=torch.long)
         last_h  = out.hidden_states[-1][:, -1, :].detach()  # [1, H]
         last_logits = out.logits[:, -1, :]
         return past_kv, kv_len, last_h, last_logits
@@ -363,10 +378,10 @@ class FixedLMRunner:
                     past_kv[i], kv_len[i] = out[0], out[1]
                 else:
                     # nothing to prefill; start fresh so we can feed the last ctx token under policy
-                    past_kv[i], kv_len[i] = None, torch.tensor([0], device=device)
+                    past_kv[i], kv_len[i] = None, torch.tensor([1], device=device)
             else:
                 # empty context
-                past_kv[i], kv_len[i] = None, torch.tensor([0], device=device)
+                past_kv[i], kv_len[i] = None, torch.tensor([1], device=device)
             # ensure this flag reflects that the first token is *not* dense-scored
             stats[i]["dense_first_token"] = False
 
@@ -474,7 +489,8 @@ class FixedLMRunner:
                 qbits_now = torch.tensor([self._qbits_axis[q_idx]], device=device, dtype=torch.int64)
                 qratio_now = qbits_now.to(torch.float32).clamp_(min=1.0) / 16.0
 
-                pos_ids = kv_len[i].unsqueeze(1)
+                # pos_ids = kv_len[i].unsqueeze(1)
+                pos_ids = (kv_len[i] - 1).clamp_min(0).unsqueeze(1)
                 bias = build_sparse_attention_bias(
                     model=self.m,
                     past_kv_lens=kv_len[i],
@@ -535,9 +551,9 @@ class FixedLMRunner:
                             out = self._dense_prefill(pref_ids)
                             past_kv[i], kv_len[i] = out[0], out[1]
                         else:
-                            past_kv[i], kv_len[i] = None, torch.tensor([0], device=device)
+                            past_kv[i], kv_len[i] = None, torch.tensor([1], device=device)
                     else:
-                        past_kv[i], kv_len[i] = None, torch.tensor([0], device=device)
+                        past_kv[i], kv_len[i] = None, torch.tensor([1], device=device)
                     steps_in_episode[i] = 0
 
         # finalize per-sample stats
@@ -591,9 +607,9 @@ class PolicyLMRunner:
         episode_len: Optional[int] = None,
         dense_refresh_tail: Optional[int] = None,
         dense_only: bool = False,
-        lambda_keep: float = 0.0,
-        lambda_prune: float = 0.0,
-        lambda_quant: float = 0.0,
+        target_C_tok: Optional[float] = None,
+        target_C_pru: Optional[float] = None,
+        target_C_qbits: Optional[float] = None,
         sparsity_bias: float = 0.0,
         prune_bias: float = 0.0,
         quant_bias: float = 0.0,
@@ -620,7 +636,20 @@ class PolicyLMRunner:
         self.thr = self.Ts + self.Tw + 1
 
         self.dense_idx = int(spec.dense_idx)
+        self.P_MAX = float(max(spec.prune_keep)) if len(spec.prune_keep) > 0 else 1.0
+
         enable_structured_controls(self.m)
+
+        # --- Enable quest/relevancy attention if requested ---
+        self.criteria = str(getattr(cfg, "sparsity_criteria", "recency")).lower()
+        self.tier = str(getattr(cfg, "relevancy_tier", "per_head"))
+        if self.criteria == "quest":
+            page = int(getattr(cfg, "quest_page_size", 16))
+            enable_quest_attention(self.m, page_size=page)
+        elif self.criteria == "relevancy":
+            enable_relevancy_attention(self.m, tier=self.tier, cfg=cfg)
+        elif self.criteria != "recency":
+            raise ValueError(f"Unknown sparsity_criteria: {self.criteria}")
         self._scalar_dim = int(getattr(self.pol, "scalar_dim", 8))
         self.sparsity_bias = float(sparsity_bias)
         self.prune_bias    = float(prune_bias)
@@ -648,19 +677,23 @@ class PolicyLMRunner:
         self.pi_temperature = float(policy_temperature)
         self.dense_only = bool(dense_only)
 
-        self.lambda_keep  = float(lambda_keep)
-        self.lambda_prune = float(lambda_prune)
-        self.lambda_quant = float(lambda_quant)
-
         self.episode_len = int(episode_len) if episode_len is not None else int(getattr(cfg, "rollout_len", 16))
         self.dense_refresh_tail = int(dense_refresh_tail) if dense_refresh_tail is not None else int(self.thr)
 
-        self.C_target = float(getattr(cfg, "C_target", getattr(cfg, "keep_target", 1.0)))
-        self.C_prune  = float(getattr(cfg, "C_target_prune", 0.70))
-        self.C_qbits  = float(getattr(cfg, "C_target_quant_bits", 8.0))
-        self.C_qratio = self.C_qbits / 16.0
-        self.criteria = str(getattr(cfg, "sparsity_criteria", "recency"))
-        self.tier = str(getattr(cfg, "relevancy_tier", "per_head"))
+        # === Target budgets (policy conditions on these) ===
+        C_tok_default = float(getattr(cfg, "C_target_token", getattr(cfg, "C_target", getattr(cfg, "keep_target", 1.0))))
+        C_pru_default = float(getattr(cfg, "C_target_prune", 0.70))
+        C_qbits_default = float(getattr(cfg, "C_target_quant_bits", 8.0))
+        if target_C_tok is None:
+            target_C_tok = getattr(cfg, "eval_C_tok", None)
+        if target_C_pru is None:
+            target_C_pru = getattr(cfg, "eval_C_pru", None)
+        if target_C_qbits is None:
+            target_C_qbits = getattr(cfg, "eval_C_qbits", None)
+        self.C_tok = float(C_tok_default if target_C_tok is None else target_C_tok)
+        self.C_pru = float(C_pru_default if target_C_pru is None else target_C_pru)
+        self.C_qbits = float(C_qbits_default if target_C_qbits is None else target_C_qbits)
+        self.C_qratio = float(self.C_qbits) / 16.0
         self.emb_layer = unwrap(self.m).get_input_embeddings()
         self._scalar_dim = int(getattr(self.pol, "scalar_dim", getattr(self.cfg, "policy_scalar_dim", 8)))
  
@@ -675,7 +708,7 @@ class PolicyLMRunner:
             output_hidden_states=True,
         )
         past_kv = out.past_key_values
-        kv_len  = torch.full((1,), ids.size(1), device=self.device, dtype=torch.long)
+        kv_len  = torch.full((1,), ids.size(1) + 1, device=self.device, dtype=torch.long)
         last_h  = out.hidden_states[-1][:, -1, :].detach()  # [1, H]
         last_logits = out.logits[:, -1, :]
         return past_kv, kv_len, last_h, last_logits
@@ -694,15 +727,15 @@ class PolicyLMRunner:
     def _build_scalars(self, t_in_episode: int, kv_len: torch.Tensor, rt: PolicyRuntimeState, steps_seen: int, total_steps_target: int):
         B = kv_len.shape[0]
 
-        # 8-D scalar layout:
-        #   [0] t_frac       in [0,1]
-        #   [1] eff_flag     in {0,1}
-        #   [2] lambda_keep
-        #   [3] lambda_prune
-        #   [4] lambda_quant
-        #   [5] dev_keep     = mean_keep_prev   - C_target
-        #   [6] dev_prune    = mean_prune_prev  - C_prune
-        #   [7] dev_qratio   = mean_qratio_prev - C_qratio
+        # 8-D scalar layout (matches training/eval):
+        #   [0] t_frac            in [0,1]
+        #   [1] eff_flag          in {0,1}
+        #   [2] C_tok_target      in [0,1]
+        #   [3] C_pru_target      in [0,1]
+        #   [4] C_qratio_target   in [0,1] (bits/16)
+        #   [5] dev_keep          = mean_keep_prev   - C_tok_target
+        #   [6] dev_prune         = mean_prune_prev  - C_pru_target
+        #   [7] dev_qratio        = mean_qratio_prev - C_qratio_target
         t_frac = torch.full(
             (B, 1),
             (t_in_episode + 1) / float(self.episode_len),
@@ -711,19 +744,20 @@ class PolicyLMRunner:
         )
         eff_flag = (kv_len > self.thr).float().view(B, 1)
 
-        lam_keep = torch.full_like(t_frac, self.lambda_keep)
-        lam_prune = torch.full_like(t_frac, self.lambda_prune)
-        lam_quant = torch.full_like(t_frac, self.lambda_quant)
+        C_tok = torch.full_like(t_frac, self.C_tok)
+        C_pru = torch.full_like(t_frac, self.C_pru)
+        C_qratio = torch.full_like(t_frac, self.C_qratio)
+
 
         mean_keep_prev = torch.where(
             rt.cum_eff > 0,
             rt.cum_keep / rt.cum_eff,
-            torch.full_like(rt.cum_keep, self.C_target),
+            torch.full_like(rt.cum_keep, self.C_tok),
         )
         mean_prune_prev = torch.where(
             rt.cum_eff > 0,
             rt.cum_prune / rt.cum_eff,
-            torch.full_like(rt.cum_prune, self.C_prune),
+            torch.full_like(rt.cum_prune, self.C_pru),
         )
         mean_qratio_prev = torch.where(
             rt.cum_eff > 0,
@@ -731,17 +765,17 @@ class PolicyLMRunner:
             torch.full_like(rt.cum_qratio, self.C_qratio),
         )
 
-        dev_keep = mean_keep_prev - self.C_target
-        dev_prune = mean_prune_prev - self.C_prune
+        dev_keep = mean_keep_prev - self.C_tok
+        dev_prune = mean_prune_prev - self.C_pru
         dev_qratio = mean_qratio_prev - self.C_qratio
 
         scalars = torch.cat(
             [
                 t_frac,
                 eff_flag,
-                lam_keep,
-                lam_prune,
-                lam_quant,
+                C_tok,
+                C_pru,
+                C_qratio,
                 dev_keep.view(B, 1),
                 dev_prune.view(B, 1),
                 dev_qratio.view(B, 1),
@@ -759,10 +793,13 @@ class PolicyLMRunner:
         policy_temperature: float = 0.7,
     ) -> Tuple[float, bool, dict]:
         device = self.device
-        ctx_len = len(ctx_ids)
-        assert ctx_len > 0, "score_continuation_with_policy requires non-empty ctx_ids to make token-0 policy-controlled"
-        # We'll prefill all BUT the last context token so the first scored token is produced under policy.
-        running = ctx_ids[:-1]
+        running = list(ctx_ids)
+        if len(running) == 0:
+            bos = self.tok.bos_token_id
+            if bos is None:
+                bos = self.tok.eos_token_id
+            running = [int(bos)]
+
         total_lp = 0.0
         is_greedy_all = True
         stats = {
@@ -780,258 +817,91 @@ class PolicyLMRunner:
             "dense_first_token": False,
         }
 
+        # Clear any residual structured state between requests
+        clear_structured_action(self.m)
+        if self.criteria == "quest":
+            clear_quest_token_budgets(self.m)
+        elif self.criteria == "relevancy":
+            clear_relevancy_keep(self.m)
+
         steps_in_episode = 0
         rt = self._new_episode_state(B=1)
-        # Dense prefill on the prefix (context minus its last token).
-        if len(running) > 0:
+
+        # Dense prefill of the "head" (exclude last token so it is processed under controls)
+        head = running[:-1]
+        if len(head) > 0:
             past_kv, kv_len, state_lm, _ = self._dense_prefill(
-                torch.tensor(running, device=device, dtype=torch.long)
+                torch.tensor(head, device=device, dtype=torch.long)
             )
         else:
-            # Empty prefix: no KV yet.
             past_kv = None
-            kv_len  = torch.tensor([0], device=device, dtype=torch.long)
-            # We won't have an LM hidden for the previous step; it's okay—policy will still run with e_tok + scalars.
-            # Make a zero vector of the correct hidden size.
+            kv_len = torch.tensor([1], device=device, dtype=torch.long)
             hidden_size = int(getattr(unwrap(self.m).config, "hidden_size",
                                       getattr(unwrap(self.m).config, "n_embd", 0)))
             state_lm = torch.zeros(1, hidden_size, device=device, dtype=torch.float32)
 
-        # === Step 0 (policy-controlled): feed the LAST context token, score cont_ids[0] ===
-        if len(cont_ids) == 0:
-            return 0.0, True, stats
-        cur0_tok = ctx_ids[-1]
-        cur0 = torch.tensor([cur0_tok], device=device, dtype=torch.long)  # [1]
-        labels0 = cont_ids[0]
-
-        if self.dense_only:
-            # Dense step: no policy action; place cur0 at position kv_len, then read logits for labels0.
-            pos_ids = kv_len.unsqueeze(1)  # write cur0 at position = current cache length
-            out0 = self.m(
-                input_ids=cur0.view(1,1),
-                use_cache=True,
-                past_key_values=past_kv,
-                position_ids=pos_ids,
-                return_dict=True,
-                output_hidden_states=True,
-            )
-            logits0 = out0.logits[:, -1, :]
-            past_kv = out0.past_key_values
-            # effective-step gating is pre-increment:
-            eff_mask = (kv_len >= self.thr)
-            kv_len = kv_len + 1
-            state_lm = out0.hidden_states[-1][:, -1, :].detach()
-
-            # Dense stats
-            kappa_now = torch.tensor([1.0], device=device)
-            prune_now = torch.tensor([1.0], device=device)
-            qratio_now = torch.tensor([1.0], device=device)
-            stats["policy_steps"] += 1
-            stats["keep_sum_all"] += float(kappa_now.item())
-            stats["prune_sum_all"] += float(prune_now.item())
-            stats["qratio_sum_all"] += float(qratio_now.item())
-            if eff_mask.item():
-                stats["effective_steps"] += 1
-                stats["keep_sum_eff"] += float(kappa_now.item())
-                stats["prune_sum_eff"] += float(prune_now.item())
-                stats["qratio_sum_eff"] += float(qratio_now.item())
-            stats["action_hist"][self.dense_idx] += 1
-        else:
-            # Policy step
-            scalars0 = self._build_scalars(
-                t_in_episode=0, kv_len=kv_len, rt=rt,
-                steps_seen=0, total_steps_target=len(cont_ids)
-            )
-            e_tok0 = self.emb_layer(cur0).detach().to(torch.float32)
-            logits_a0, _v0, pi_next0 = self.pol.step(
-                h_lm=state_lm.to(torch.float32),
-                e_tok=e_tok0,
-                scalars=scalars0,
-                state=rt.pi_state,
-                temperature=policy_temperature,
-            )
-            if self._logit_bias is not None:
-                logits_a0 = logits_a0 - self._logit_bias.to(logits_a0.dtype)
-            a0 = torch.argmax(logits_a0, dim=-1) if greedy_actions else Categorical(logits=logits_a0).sample()
-            eff_mask = (kv_len >= self.thr)
-            a0_eff = torch.where(eff_mask, a0, torch.tensor([self.dense_idx], device=device))
-            rt.pi_state = pi_next0
-            rt.pi_state.last_action = a0_eff.detach()
-
-            kappa_now  = self.KEEP[a0_eff]
-            prune_now  = self.PRUNE[a0_eff]
-            qbits_now  = self.QBITS[a0_eff]
-            qratio_now = qbits_now.to(torch.float32).clamp_(min=1.0) / 16.0
-            pos_ids = kv_len.unsqueeze(1)  # write cur0 at current length
-            bias = build_sparse_attention_bias(
-                model=self.m,
-                past_kv_lens=kv_len,
-                keep_fracs=kappa_now,
-                Ts=self.Ts, Tw=self.Tw,
-                device=device, dtype=self.dtype,
-                criteria=self.criteria, tier=self.tier,
-            )
-            set_structured_action(self.m, float(prune_now.item()), int(qbits_now.item()))
-            out0 = self.m(
-                input_ids=cur0.view(1,1),
-                use_cache=True,
-                past_key_values=past_kv,
-                position_ids=pos_ids,
-                attention_mask=bias,
-                return_dict=True,
-                output_hidden_states=True,
-            )
-            clear_structured_action(self.m)
-            logits0 = out0.logits[:, -1, :]
-            past_kv = out0.past_key_values
-            if eff_mask.item():
-                stats["effective_steps"] += 1
-            kv_len = kv_len + 1
-            state_lm = out0.hidden_states[-1][:, -1, :].detach()
-
-            stats["policy_steps"] += 1
-            stats["keep_sum_all"] += float(kappa_now.item())
-            stats["prune_sum_all"] += float(prune_now.item())
-            stats["qratio_sum_all"] += float(qratio_now.item())
-            a_idx0 = int(a0_eff.item())
-            stats["action_hist"][a_idx0] += 1
-            if eff_mask.item():
-                stats["keep_sum_eff"] += float(kappa_now.item())
-                stats["prune_sum_eff"] += float(prune_now.item())
-                stats["qratio_sum_eff"] += float(qratio_now.item())
-
-        # Score labels0 from logits0 (first continuation token)
-        logp0 = F.log_softmax(logits0, dim=-1)[0, labels0]
-        total_lp += float(logp0.item())
-        greedy_tok0 = int(torch.argmax(logits0, dim=-1)[0].item())
-        if greedy_tok0 != labels0:
-            is_greedy_all = False
-        running.append(labels0)
-        # Budget tracking after step 0 (for future scalar features)
-        eff0 = eff_mask.float()
-        rt.cum_eff    = rt.cum_eff    + eff0
-        rt.cum_keep   = rt.cum_keep   + eff0 * kappa_now
-        rt.cum_prune  = rt.cum_prune  + eff0 * (prune_now.to(torch.float32) / self.P_MAX)
-        rt.cum_qratio = rt.cum_qratio + eff0 * qratio_now
-        steps_in_episode += 1
-        if steps_in_episode >= self.episode_len:
-            steps_in_episode = 0
-        if self.dense_only:
-            for i in range(1, len(cont_ids)):
-                if steps_in_episode == 0 and i > 0:
-                    max_ctx = int(getattr(unwrap(self.m).config, "max_position_embeddings", 4096)) - 1
-                    pref_window = min(self.dense_refresh_tail, max_ctx, len(running))
-                    # Re-densify without the last token so the next step feeds it (no double-feed).
-                    tail = running[-pref_window:] if pref_window > 0 else []
-                    head = tail[:-1]  # exclude last token
-                    if len(head) > 0:
-                        pref_ids = torch.tensor(head, device=device, dtype=torch.long)
-                        past_kv, kv_len, state_lm, _ = self._dense_prefill(pref_ids)
-                    else:
-                        # No head to prefill: start a fresh cache; the next step will write the last token at pos 0.
-                        past_kv = None
-                        kv_len  = torch.tensor([0], device=device, dtype=torch.long)
-                        hidden_size = int(getattr(unwrap(self.m).config, "hidden_size",
-                                                   getattr(unwrap(self.m).config, "n_embd", 0)))
-                        state_lm = torch.zeros(1, hidden_size, device=device, dtype=torch.float32)
-                cur_tok = running[-1]
-                cur = torch.tensor([cur_tok], device=device, dtype=torch.long)
-                pos_ids = kv_len.unsqueeze(1)
-                out_step = self.m(
-                    input_ids=cur.view(1, 1),
-                    use_cache=True,
-                    past_key_values=past_kv,
-                    position_ids=pos_ids,
-                    return_dict=True,
-                )
-                logits_step = out_step.logits[:, -1, :]
-                past_kv = out_step.past_key_values
-                eff_mask = (kv_len >= self.thr)
-                kv_len = kv_len + 1
-                kappa_now = torch.tensor([1.0], device=device)
-                prune_now = torch.tensor([1.0], device=device)
-                qratio_now = torch.tensor([1.0], device=device)
-                stats["policy_steps"] += 1
-                stats["keep_sum_all"] += float(kappa_now.item())
-                stats["prune_sum_all"] += float(prune_now.item())
-                stats["qratio_sum_all"] += float(qratio_now.item())
-                if eff_mask.item():
-                    stats["effective_steps"] += 1
-                    stats["keep_sum_eff"] += float(kappa_now.item())
-                    stats["prune_sum_eff"] += float(prune_now.item())
-                    stats["qratio_sum_eff"] += float(qratio_now.item())
-                stats["action_hist"][self.dense_idx] += 1
-
-                labels_next = cont_ids[i]
-                logp = F.log_softmax(logits_step, dim=-1)[0, labels_next]
-                total_lp += float(logp.item())
-                greedy_tok = int(torch.argmax(logits_step, dim=-1)[0].item())
-                if greedy_tok != labels_next:
-                    is_greedy_all = False
-                running.append(labels_next)
-                steps_in_episode += 1
-                if steps_in_episode >= self.episode_len:
-                    steps_in_episode = 0
-            stats["keep_avg_all"] = (stats["keep_sum_all"] / max(1, stats["policy_steps"]))
-            stats["keep_avg_eff"] = (stats["keep_sum_eff"] / max(1, stats["effective_steps"]))
-            total_actions = max(1, sum(stats["action_hist"]))
-            stats["action_probs"] = [c / total_actions for c in stats["action_hist"]]
-            return total_lp, is_greedy_all, stats
-
-        for i in range(1, len(cont_ids)):
-            if steps_in_episode == 0 and i > 0:
+        for i, labels_next in enumerate(cont_ids):
+            if i > 0 and steps_in_episode == 0:
                 max_ctx = int(getattr(unwrap(self.m).config, "max_position_embeddings", 4096)) - 1
                 pref_window = min(self.dense_refresh_tail, max_ctx, len(running))
-                # Re-densify on the head, excluding the last token, so the next step is policy-controlled.
                 tail = running[-pref_window:] if pref_window > 0 else []
                 head = tail[:-1]
                 if len(head) > 0:
-                    pref_ids = torch.tensor(head, device=device, dtype=torch.long)
-                    past_kv, kv_len, state_lm, _ = self._dense_prefill(pref_ids)
+                    past_kv, kv_len, state_lm, _ = self._dense_prefill(
+                        torch.tensor(head, device=device, dtype=torch.long)
+                    )
                 else:
                     past_kv = None
-                    kv_len  = torch.tensor([0], device=device, dtype=torch.long)
+                    kv_len = torch.tensor([1], device=device, dtype=torch.long)
                     hidden_size = int(getattr(unwrap(self.m).config, "hidden_size",
-                                               getattr(unwrap(self.m).config, "n_embd", 0)))
+                                              getattr(unwrap(self.m).config, "n_embd", 0)))
                     state_lm = torch.zeros(1, hidden_size, device=device, dtype=torch.float32)
                 rt = self._new_episode_state(B=1)
-            cur_tok = running[-1]
-            cur = torch.tensor([cur_tok], device=device, dtype=torch.long)  # [1]
-            labels_next = cont_ids[i]
 
-            scalars = self._build_scalars(
-                t_in_episode=steps_in_episode,
-                kv_len=kv_len,
-                rt=rt,
-                steps_seen=i,
-                total_steps_target=len(cont_ids),
-            )
-            e_tok = self.emb_layer(cur).detach().to(torch.float32)  # [1,E]
+            cur_tok = int(running[-1])
+            cur = torch.tensor([cur_tok], device=device, dtype=torch.long)
+            labels_next = int(labels_next)
 
-            logits_a, _v_unused, pi_next = self.pol.step(
-                h_lm=state_lm.to(torch.float32),
-                e_tok=e_tok,
-                scalars=scalars,
-                state=rt.pi_state,
-                temperature=policy_temperature,
-            )
-            if self._logit_bias is not None:
-                logits_a = logits_a - self._logit_bias.to(logits_a.dtype)
-            if self.greedy_policy:
-                a = torch.argmax(logits_a, dim=-1)  # [1]
+            eff_mask = (kv_len > self.thr)  # [1] bool
+
+            if self.dense_only:
+                a_eff = torch.tensor([self.dense_idx], device=device, dtype=torch.long)
+                kappa_now = self.KEEP[a_eff]
+                prune_now = self.PRUNE[a_eff]
+                qbits_now = self.QBITS[a_eff]
+                qratio_now = qbits_now.to(torch.float32).clamp_(min=1.0) / 16.0
             else:
-                a = Categorical(logits=logits_a).sample()  # [1]
+                scalars = self._build_scalars(
+                    t_in_episode=steps_in_episode,
+                    kv_len=kv_len,
+                    rt=rt,
+                    steps_seen=i,
+                    total_steps_target=len(cont_ids),
+                )
+                e_tok = self.emb_layer(cur).detach().to(torch.float32)
+                logits_a, _v, pi_next = self.pol.step(
+                    h_lm=state_lm.to(torch.float32),
+                    e_tok=e_tok,
+                    scalars=scalars,
+                    state=rt.pi_state,
+                    temperature=policy_temperature,
+                )
+                if self._logit_bias is not None:
+                    logits_a = logits_a - self._logit_bias.to(logits_a.dtype)
+                if greedy_actions or self.greedy_policy:
+                    a = torch.argmax(logits_a, dim=-1)
+                else:
+                    a = Categorical(logits=logits_a).sample()
+                a_eff = torch.where(eff_mask, a, torch.tensor([self.dense_idx], device=device))
+                rt.pi_state = pi_next
+                rt.pi_state.last_action = a_eff.detach()
 
-            eff_mask = (kv_len >= self.thr)
-            a_eff = torch.where(eff_mask, a, torch.tensor([self.dense_idx], device=device))
-            rt.pi_state = pi_next
-            rt.pi_state.last_action = a_eff.detach()
+                kappa_now = self.KEEP[a_eff]
+                prune_now = self.PRUNE[a_eff]
+                qbits_now = self.QBITS[a_eff]
+                qratio_now = qbits_now.to(torch.float32).clamp_(min=1.0) / 16.0
 
-            kappa_now  = self.KEEP[a_eff]        # [1]
-            prune_now  = self.PRUNE[a_eff]       # [1]
-            qbits_now  = self.QBITS[a_eff]       # [1]
-            qratio_now = qbits_now.to(torch.float32).clamp_(min=1.0) / 16.0
-            pos_ids = kv_len.unsqueeze(1)
+            pos_ids = (kv_len - 1).clamp_min(0).unsqueeze(1)
             bias = build_sparse_attention_bias(
                 model=self.m,
                 past_kv_lens=kv_len,
@@ -1042,7 +912,7 @@ class PolicyLMRunner:
             )
             set_structured_action(self.m, float(prune_now.item()), int(qbits_now.item()))
             out_step = self.m(
-                input_ids=cur.view(1,1),
+                input_ids=cur.view(1, 1),
                 use_cache=True,
                 past_key_values=past_kv,
                 position_ids=pos_ids,
@@ -1051,47 +921,57 @@ class PolicyLMRunner:
                 output_hidden_states=True,
             )
             clear_structured_action(self.m)
+
             logits_step = out_step.logits[:, -1, :]
             past_kv = out_step.past_key_values
             kv_len = kv_len + 1
             state_lm = out_step.hidden_states[-1][:, -1, :].detach()
 
+            # Stats
             stats["policy_steps"] += 1
             stats["keep_sum_all"] += float(kappa_now.item())
             stats["prune_sum_all"] += float(prune_now.item())
             stats["qratio_sum_all"] += float(qratio_now.item())
-            a_idx = int(a_eff.item())
-            stats["action_hist"][a_idx] += 1
+            stats["action_hist"][int(a_eff.item())] += 1
             if eff_mask.item():
                 stats["effective_steps"] += 1
                 stats["keep_sum_eff"] += float(kappa_now.item())
                 stats["prune_sum_eff"] += float(prune_now.item())
                 stats["qratio_sum_eff"] += float(qratio_now.item())
 
+            # Score continuation token
             logp = F.log_softmax(logits_step, dim=-1)[0, labels_next]
             total_lp += float(logp.item())
             greedy_tok = int(torch.argmax(logits_step, dim=-1)[0].item())
             if greedy_tok != labels_next:
                 is_greedy_all = False
-            running.append(labels_next)
-            eff = eff_mask.float()
-            rt.cum_eff    = rt.cum_eff    + eff
-            rt.cum_keep   = rt.cum_keep   + eff * kappa_now
-            rt.cum_prune  = rt.cum_prune  + eff * (prune_now.to(torch.float32) / self.P_MAX)
+
+            # Budget tracking for next step scalars (effective steps only)
+            eff = eff_mask.to(torch.float32)
+            rt.cum_eff = rt.cum_eff + eff
+            rt.cum_keep = rt.cum_keep + eff * kappa_now
+            rt.cum_prune = rt.cum_prune + eff * (prune_now.to(torch.float32) / self.P_MAX)
             rt.cum_qratio = rt.cum_qratio + eff * qratio_now
 
+            running.append(labels_next)
             steps_in_episode += 1
             if steps_in_episode >= self.episode_len:
                 steps_in_episode = 0
+
+        # finalize
         stats["keep_avg_all"] = (stats["keep_sum_all"] / max(1, stats["policy_steps"]))
-        stats["keep_avg_eff"] = (stats["keep_sum_eff"] / max(1, stats["effective_steps"]))
+        if stats["effective_steps"] > 0:
+            stats["keep_avg_eff"] = (stats["keep_sum_eff"] / max(1, stats["effective_steps"]))
+        else:
+            stats["keep_avg_eff"] = stats["keep_avg_all"]
+        stats["prune_avg_all"] = (stats["prune_sum_all"] / max(1, stats["policy_steps"]))
+        stats["prune_avg_eff"] = (stats["prune_sum_eff"] / max(1, stats["effective_steps"])) if stats["effective_steps"] > 0 else stats["prune_avg_all"]
+        stats["quant_ratio_avg_all"] = (stats["qratio_sum_all"] / max(1, stats["policy_steps"]))
+        stats["quant_ratio_avg_eff"] = (stats["qratio_sum_eff"] / max(1, stats["effective_steps"])) if stats["effective_steps"] > 0 else stats["quant_ratio_avg_all"]
+        stats["avg_prune_keep"] = stats["prune_avg_eff"]
+        stats["avg_quant_ratio"] = stats["quant_ratio_avg_eff"]
         total_actions = max(1, sum(stats["action_hist"]))
         stats["action_probs"] = [c / total_actions for c in stats["action_hist"]]
-        stats["prune_avg_all"] = (stats["prune_sum_all"] / max(1, stats["policy_steps"]))
-        stats["prune_avg_eff"] = (stats["prune_sum_eff"] / max(1, stats["effective_steps"]))
-        stats["quant_ratio_avg_all"] = (stats["qratio_sum_all"] / max(1, stats["policy_steps"]))
-        stats["quant_ratio_avg_eff"] = (stats["qratio_sum_eff"] / max(1, stats["effective_steps"]))
-        stats["avg_prune_keep"] = stats["prune_avg_eff"]; stats["avg_quant_ratio"] = stats["quant_ratio_avg_eff"]
         return total_lp, is_greedy_all, stats
 
     @torch.inference_mode()
@@ -1105,13 +985,16 @@ class PolicyLMRunner:
         top_k: Optional[int] = None,
         return_stats: bool = False,
     ) -> List[int] | Tuple[List[int], dict]:
-        """
-        Autoregressive generation under policy-controlled sparsity with episodic refresh.
-        """
         device = self.device
-        running = ctx_ids[:]
-        steps_in_episode = 0
-        rt = self._new_episode_state(B=1)
+        orig_ctx_len = len(ctx_ids)
+        running = list(ctx_ids)
+        if len(running) == 0:
+            bos = self.tok.bos_token_id
+            if bos is None:
+                bos = self.tok.eos_token_id
+            running = [int(bos)]
+            orig_ctx_len = len(running)  # treat inserted BOS as context
+
         stop_seqs = [self.tok.encode(s, add_special_tokens=False) for s in (until or [])]
 
         stats = {
@@ -1129,19 +1012,26 @@ class PolicyLMRunner:
             "dense_first_token": False,
         }
 
+        # Clear any residual structured state between requests
+        clear_structured_action(self.m)
+        if self.criteria == "quest":
+            clear_quest_token_budgets(self.m)
+        elif self.criteria == "relevancy":
+            clear_relevancy_keep(self.m)
+
         def sample_from_logits(logits):
             if temperature <= 0:
                 return int(torch.argmax(logits, dim=-1)[0].item())
-            probs = F.softmax(logits / temperature, dim=-1)
+            probs = F.softmax(logits / float(temperature), dim=-1)
             if top_k is not None and top_k > 0:
-                topk_vals, topk_idx = torch.topk(probs, k=min(top_k, probs.size(-1)), dim=-1)
+                topk_vals, topk_idx = torch.topk(probs, k=min(int(top_k), probs.size(-1)), dim=-1)
                 probs_topk = topk_vals / topk_vals.sum(dim=-1, keepdim=True)
                 idx = torch.multinomial(probs_topk, num_samples=1)
                 return int(topk_idx[0, idx[0]].item())
-            if top_p is not None and 0 < top_p < 1:
+            if top_p is not None and 0 < float(top_p) < 1:
                 sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
                 cumsum = torch.cumsum(sorted_probs, dim=-1)
-                mask = cumsum <= top_p
+                mask = cumsum <= float(top_p)
                 mask[..., 0] = True
                 probs_np = (sorted_probs * mask).to(probs.dtype)
                 probs_np = probs_np / probs_np.sum(dim=-1, keepdim=True)
@@ -1149,163 +1039,79 @@ class PolicyLMRunner:
                 return int(sorted_idx[0, idx[0]].item())
             return int(torch.multinomial(probs, 1)[0].item())
 
-        past_kv, kv_len, state_lm, last_logits = self._dense_prefill(torch.tensor(running, dtype=torch.long))
-        use_prefill_logits = True
-        stop_strs = until or []
-        for _ in range(max_new_tokens):
-            if self.dense_only:
-                if use_prefill_logits:
-                    nxt = sample_from_logits(last_logits)
-                    running.append(nxt)
-                    gen_ids = running[len(ctx_ids):]
-                    trim = match_stop_suffix(gen_ids, stop_seqs)
-                    if trim:
-                        del running[-trim:]
-                        break
-                    cur = torch.tensor([nxt], device=device, dtype=torch.long)
-                    pos_ids = kv_len.unsqueeze(1)
-                    clear_structured_action(self.m)
-                    out_step = self.m(
-                        input_ids=cur.view(1,1),
-                        use_cache=True,
-                        past_key_values=past_kv,
-                        position_ids=pos_ids,
-                        return_dict=True,
-                    )
-                    logits_step = out_step.logits[:, -1, :]
-                    past_kv = out_step.past_key_values
-                    kv_len = kv_len + 1
-                    kappa_now = torch.tensor([1.0], device=device)
-                    prune_now = torch.tensor([1.0], device=device)
-                    qratio_now = torch.tensor([1.0], device=device)
-                    stats["policy_steps"] += 1
-                    stats["keep_sum_all"] += float(kappa_now.item())
-                    stats["prune_sum_all"] += float(prune_now.item())
-                    stats["qratio_sum_all"] += float(qratio_now.item())
-                    eff_mask = (kv_len > self.thr)
-                    if eff_mask.item():
-                        stats["effective_steps"] += 1
-                        stats["keep_sum_eff"] += float(kappa_now.item())
-                        stats["prune_sum_eff"] += float(prune_now.item())
-                        stats["qratio_sum_eff"] += float(qratio_now.item())
-                    stats["action_hist"][self.dense_idx] += 1
-                    use_prefill_logits = False
-                    continue
-                cur_tok = running[-1]
-                cur = torch.tensor([cur_tok], device=device, dtype=torch.long)
-                pos_ids = kv_len.unsqueeze(1) 
-                clear_structured_action(self.m)
-                out_step = self.m(
-                    input_ids=cur.view(1,1),
-                    use_cache=True,
-                    past_key_values=past_kv,
-                    position_ids=pos_ids,
-                    return_dict=True,
-                )
-                logits_step = out_step.logits[:, -1, :]
-                past_kv = out_step.past_key_values
-                kv_len = kv_len + 1
-                kappa_now = torch.tensor([1.0], device=device)
-                prune_now = torch.tensor([1.0], device=device)
-                qratio_now = torch.tensor([1.0], device=device)
-                stats["policy_steps"] += 1
-                stats["keep_sum_all"] += float(kappa_now.item())
-                stats["prune_sum_all"] += float(prune_now.item())
-                stats["qratio_sum_all"] += float(qratio_now.item())
-                eff_mask = (kv_len > self.thr)
-                if eff_mask.item():
-                    stats["effective_steps"] += 1
-                    stats["keep_sum_eff"] += float(kappa_now.item())
-                    stats["prune_sum_eff"] += float(prune_now.item())
-                    stats["qratio_sum_eff"] += float(qratio_now.item())
-                stats["action_hist"][self.dense_idx] += 1
-                nxt = sample_from_logits(logits_step)
-                running.append(nxt)
-                gen_ids = running[len(ctx_ids):]
-                trim = match_stop_suffix(gen_ids, stop_seqs)
-                if trim:
-                    del running[-trim:]
-                    break
-                continue
+        steps_in_episode = 0
+        rt = self._new_episode_state(B=1)
 
-            if steps_in_episode == 0:
+        # Dense prefill head (exclude last token so it is processed under controls)
+        head = running[:-1]
+        if len(head) > 0:
+            past_kv, kv_len, state_lm, _ = self._dense_prefill(
+                torch.tensor(head, device=device, dtype=torch.long)
+            )
+        else:
+            past_kv = None
+            kv_len = torch.tensor([1], device=device, dtype=torch.long)
+            hidden_size = int(getattr(unwrap(self.m).config, "hidden_size",
+                                      getattr(unwrap(self.m).config, "n_embd", 0)))
+            state_lm = torch.zeros(1, hidden_size, device=device, dtype=torch.float32)
+
+        for step in range(max_new_tokens):
+            if step > 0 and steps_in_episode == 0:
                 max_ctx = int(getattr(unwrap(self.m).config, "max_position_embeddings", 4096)) - 1
-                pref_ids = torch.tensor(running[-max_ctx:], device=device, dtype=torch.long)
-                past_kv, kv_len, state_lm, last_logits = self._dense_prefill(pref_ids)
+                pref_window = min(self.dense_refresh_tail, max_ctx, len(running))
+                tail = running[-pref_window:] if pref_window > 0 else []
+                head = tail[:-1]
+                if len(head) > 0:
+                    past_kv, kv_len, state_lm, _ = self._dense_prefill(
+                        torch.tensor(head, device=device, dtype=torch.long)
+                    )
+                else:
+                    past_kv = None
+                    kv_len = torch.tensor([1], device=device, dtype=torch.long)
+                    hidden_size = int(getattr(unwrap(self.m).config, "hidden_size",
+                                              getattr(unwrap(self.m).config, "n_embd", 0)))
+                    state_lm = torch.zeros(1, hidden_size, device=device, dtype=torch.float32)
                 rt = self._new_episode_state(B=1)
-                # Consume prefill logits once (do not re-feed last token)
-                use_prefill_logits = True
 
-            if use_prefill_logits:
-                nxt = sample_from_logits(last_logits)
-                running.append(nxt)
-                gen_ids = running[len(ctx_ids):]
-                trim = match_stop_suffix(gen_ids, stop_seqs)
-                if trim:
-                    del running[-trim:]
-                    break
-                # push into cache & get next logits/state
-                cur = torch.tensor([nxt], device=device, dtype=torch.long)
-                pos_ids = kv_len.unsqueeze(1)
-                out_step = self.m(
-                    input_ids=cur.view(1,1),
-                    use_cache=True,
-                    past_key_values=past_kv,
-                    position_ids=pos_ids,
-                    return_dict=True,
-                    output_hidden_states=True,
-                )
-                logits_step = out_step.logits[:, -1, :]
-                past_kv = out_step.past_key_values
-                kv_len = kv_len + 1
-                state_lm = out_step.hidden_states[-1][:, -1, :].detach()
-                # dense accounting for this step
-                kappa_now = torch.tensor([1.0], device=device)
-                prune_now = torch.tensor([1.0], device=device)
-                qratio_now = torch.tensor([1.0], device=device)
-                stats["policy_steps"] += 1
-                stats["keep_sum_all"] += float(kappa_now.item())
-                stats["prune_sum_all"] += float(prune_now.item())
-                stats["qratio_sum_all"] += float(qratio_now.item())
-                eff_mask = (kv_len > self.thr)
-                if eff_mask.item():
-                    stats["effective_steps"] += 1
-                    stats["keep_sum_eff"] += float(kappa_now.item())
-                    stats["prune_sum_eff"] += float(prune_now.item())
-                    stats["qratio_sum_eff"] += float(qratio_now.item())
-                stats["action_hist"][self.dense_idx] += 1
-                steps_in_episode += 1
-                use_prefill_logits = False
-                continue
-
-            cur_tok = running[-1]
+            cur_tok = int(running[-1])
             cur = torch.tensor([cur_tok], device=device, dtype=torch.long)
-
-            scalars = self._build_scalars(
-                t_in_episode=steps_in_episode, kv_len=kv_len, rt=rt,
-                steps_seen=len(running), total_steps_target=len(running) + max_new_tokens
-            )
-            e_tok = self.emb_layer(cur).detach().to(torch.float32)
-            logits_a, _v, pi_next = self.pol.step(
-                h_lm=state_lm.to(torch.float32),
-                e_tok=e_tok,
-                scalars=scalars,
-                state=rt.pi_state,
-                temperature=self.pi_temperature,
-            )
-            if self._logit_bias is not None:
-                logits_a = logits_a - self._logit_bias.to(logits_a.dtype)
-            a = torch.argmax(logits_a, dim=-1) if self.greedy_policy else Categorical(logits=logits_a).sample()
             eff_mask = (kv_len > self.thr)
-            a_eff = torch.where(eff_mask, a, torch.tensor([self.dense_idx], device=device))
-            rt.pi_state = pi_next
-            rt.pi_state.last_action = a_eff.detach()
-            kappa_now  = self.KEEP[a_eff]
-            prune_now  = self.PRUNE[a_eff]
-            qbits_now  = self.QBITS[a_eff]
-            qratio_now = qbits_now.to(torch.float32).clamp_(min=1.0) / 16.0
 
-            pos_ids = kv_len.unsqueeze(1)
+            if self.dense_only:
+                a_eff = torch.tensor([self.dense_idx], device=device, dtype=torch.long)
+                kappa_now = self.KEEP[a_eff]
+                prune_now = self.PRUNE[a_eff]
+                qbits_now = self.QBITS[a_eff]
+                qratio_now = qbits_now.to(torch.float32).clamp_(min=1.0) / 16.0
+            else:
+                scalars = self._build_scalars(
+                    t_in_episode=steps_in_episode,
+                    kv_len=kv_len,
+                    rt=rt,
+                    steps_seen=len(running),
+                    total_steps_target=len(running) + max_new_tokens,
+                )
+                e_tok = self.emb_layer(cur).detach().to(torch.float32)
+                logits_a, _v, pi_next = self.pol.step(
+                    h_lm=state_lm.to(torch.float32),
+                    e_tok=e_tok,
+                    scalars=scalars,
+                    state=rt.pi_state,
+                    temperature=self.pi_temperature,
+                )
+                if self._logit_bias is not None:
+                    logits_a = logits_a - self._logit_bias.to(logits_a.dtype)
+                a = torch.argmax(logits_a, dim=-1) if self.greedy_policy else Categorical(logits=logits_a).sample()
+                a_eff = torch.where(eff_mask, a, torch.tensor([self.dense_idx], device=device))
+                rt.pi_state = pi_next
+                rt.pi_state.last_action = a_eff.detach()
+
+                kappa_now = self.KEEP[a_eff]
+                prune_now = self.PRUNE[a_eff]
+                qbits_now = self.QBITS[a_eff]
+                qratio_now = qbits_now.to(torch.float32).clamp_(min=1.0) / 16.0
+
+            pos_ids = (kv_len - 1).clamp_min(0).unsqueeze(1)
             bias = build_sparse_attention_bias(
                 model=self.m,
                 past_kv_lens=kv_len,
@@ -1316,7 +1122,7 @@ class PolicyLMRunner:
             )
             set_structured_action(self.m, float(prune_now.item()), int(qbits_now.item()))
             out_step = self.m(
-                input_ids=cur.view(1,1),
+                input_ids=cur.view(1, 1),
                 use_cache=True,
                 past_key_values=past_kv,
                 position_ids=pos_ids,
@@ -1325,17 +1131,18 @@ class PolicyLMRunner:
                 output_hidden_states=True,
             )
             clear_structured_action(self.m)
+
             logits_step = out_step.logits[:, -1, :]
             past_kv = out_step.past_key_values
             kv_len = kv_len + 1
             state_lm = out_step.hidden_states[-1][:, -1, :].detach()
 
+            # Stats
             stats["policy_steps"] += 1
             stats["keep_sum_all"] += float(kappa_now.item())
             stats["prune_sum_all"] += float(prune_now.item())
             stats["qratio_sum_all"] += float(qratio_now.item())
-            a_idx = int(a_eff.item())
-            stats["action_hist"][a_idx] += 1
+            stats["action_hist"][int(a_eff.item())] += 1
             if eff_mask.item():
                 stats["effective_steps"] += 1
                 stats["keep_sum_eff"] += float(kappa_now.item())
@@ -1343,34 +1150,35 @@ class PolicyLMRunner:
                 stats["qratio_sum_eff"] += float(qratio_now.item())
 
             nxt = sample_from_logits(logits_step)
-            running.append(nxt)
-            gen_ids = running[len(ctx_ids):]
-            trim = match_stop_suffix(gen_ids, stop_seqs)
-            text = self.tok.decode(running, skip_special_tokens=True)
+            running.append(int(nxt))
 
+            gen_ids = running[orig_ctx_len:]
+            trim = match_stop_suffix(gen_ids, stop_seqs)
             if trim:
                 del running[-trim:]
                 break
 
-
-            eff = eff_mask.float()
-            rt.cum_eff    = rt.cum_eff    + eff
-            rt.cum_keep   = rt.cum_keep   + eff * kappa_now
-            rt.cum_prune  = rt.cum_prune  + eff * (prune_now.to(torch.float32) / self.P_MAX)
+            # Budget tracking for next-step features (effective steps only)
+            eff = eff_mask.to(torch.float32)
+            rt.cum_eff = rt.cum_eff + eff
+            rt.cum_keep = rt.cum_keep + eff * kappa_now
+            rt.cum_prune = rt.cum_prune + eff * (prune_now.to(torch.float32) / self.P_MAX)
             rt.cum_qratio = rt.cum_qratio + eff * qratio_now
 
             steps_in_episode += 1
             if steps_in_episode >= self.episode_len:
                 steps_in_episode = 0
+
         stats["keep_avg_all"] = (stats["keep_sum_all"] / max(1, stats["policy_steps"]))
-        stats["keep_avg_eff"] = (stats["keep_sum_eff"] / max(1, stats["effective_steps"]))
+        stats["keep_avg_eff"] = (stats["keep_sum_eff"] / max(1, stats["effective_steps"])) if stats["effective_steps"] > 0 else stats["keep_avg_all"]
+        stats["prune_avg_all"] = (stats["prune_sum_all"] / max(1, stats["policy_steps"]))
+        stats["prune_avg_eff"] = (stats["prune_sum_eff"] / max(1, stats["effective_steps"])) if stats["effective_steps"] > 0 else stats["prune_avg_all"]
+        stats["quant_ratio_avg_all"] = (stats["qratio_sum_all"] / max(1, stats["policy_steps"]))
+        stats["quant_ratio_avg_eff"] = (stats["qratio_sum_eff"] / max(1, stats["effective_steps"])) if stats["effective_steps"] > 0 else stats["quant_ratio_avg_all"]
+        stats["avg_prune_keep"] = stats["prune_avg_eff"]
+        stats["avg_quant_ratio"] = stats["quant_ratio_avg_eff"]
         total_actions = max(1, sum(stats["action_hist"]))
         stats["action_probs"] = [c / total_actions for c in stats["action_hist"]]
-        stats["prune_avg_all"] = (stats["prune_sum_all"] / max(1, stats["policy_steps"]))
-        stats["prune_avg_eff"] = (stats["prune_sum_eff"] / max(1, stats["effective_steps"]))
-        stats["quant_ratio_avg_all"] = (stats["qratio_sum_all"] / max(1, stats["policy_steps"]))
-        stats["quant_ratio_avg_eff"] = (stats["qratio_sum_eff"] / max(1, stats["effective_steps"]))
-        stats["avg_prune_keep"] = stats["prune_avg_eff"]; stats["avg_quant_ratio"] = stats["quant_ratio_avg_eff"]
 
-        return (running[len(ctx_ids):], stats) if return_stats else running[len(ctx_ids):]
-
+        gen = running[orig_ctx_len:]
+        return (gen, stats) if return_stats else gen
