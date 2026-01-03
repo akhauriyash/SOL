@@ -15,6 +15,7 @@ from lm_eval.api.model import LM
 from lm_eval import evaluator
 import os
 import numpy as np
+import sys
 
 from policy_runtime import PolicyLMRunner
 from policy_harness import PolicyHarnessLM, FixedHarnessLM
@@ -115,7 +116,8 @@ def print_compact_summary(res):
     accs = []
     print("\n=== Per-task accuracy ===")
     for task, metrics in results.items():
-        for k in ("acc,none", "acc", "exact_match,none", "exact_match"):
+        # lm-eval tasks often expose acc_norm (ARC, etc.) in addition to acc.
+        for k in ("acc_norm,none", "acc_norm", "acc,none", "acc", "exact_match,none", "exact_match"):
             if k in metrics:
                 v = metrics[k]
                 print(f"{task}: {v:.4f}")
@@ -203,6 +205,7 @@ def main():
     p.add_argument("--tasks", type=str, default="piqa,arc_easy")
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--limit", type=int, default=None, help="Limit samples per task (LM-Eval)")
+    p.add_argument("--only_dense", action="store_true", help="Run dense-only LM-Eval and exit.")
     p.add_argument("--episode_len", type=int, default=None, help="Override episode length (default cfg.rollout_len)")
     p.add_argument("--dense_refresh_tail", type=int, default=None, help="Tail tokens to dense-prefill between episodes (default Ts+Tw+1)")
     p.add_argument("--policy_temperature", type=float, default=0.6)
@@ -245,6 +248,54 @@ def main():
     _check01("--tgt_prune_keep", args.tgt_prune_keep)
     if args.tgt_quant_bits is not None and float(args.tgt_quant_bits) <= 0:
         raise ValueError(f"--tgt_quant_bits must be > 0, got {args.tgt_quant_bits}")
+
+    tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
+
+    # --- NEW: dense-only mode (run once, useful for scans) ---
+    if args.only_dense:
+        dense_model = PolicyHarnessLM(
+            ckpt_dir=args.ckpt_dir,
+            mode=args.mode,
+            greedy_policy=True,
+            policy_temperature=args.policy_temperature,
+            episode_len=args.episode_len,
+            dense_refresh_tail=args.dense_refresh_tail,
+            sparsity_bias=float(args.sparsity_bias),
+            prune_bias=float(args.prune_bias),
+            quant_bias=float(args.quant_bias),
+            target_C_tok=args.tgt_keep,
+            target_C_pru=args.tgt_prune_keep,
+            target_C_qbits=args.tgt_quant_bits,
+            dense_only=True,
+            max_batch=args.batch_size,
+        )
+
+        res_dense = evaluator.simple_evaluate(
+            model=dense_model,
+            tasks=tasks,
+            batch_size=args.batch_size,
+            limit=args.limit,
+            num_fewshot=0,
+        )
+        dense_stats = dense_model.export_sparsity_stats()
+        print("\n=== Observed sparsity (dense-only) ===")
+        print(json.dumps(dense_stats["global"], indent=2, default=_json_default))
+        print("\n\n## Dense-only result")
+        print_compact_summary(res_dense)
+
+        if args.export_sparsity_json:
+            with open(args.export_sparsity_json, "w") as f:
+                json.dump(dense_stats, f, indent=2, default=_json_default)
+            print(f"[saved] per-request sparsity (dense-only) → {args.export_sparsity_json}")
+
+            _write_key_metrics(
+                sidecar_path=args.export_sparsity_json,
+                stats_dense=dense_stats, res_dense=res_dense,
+            )
+
+        # Optionally dump full results JSON to stdout (already printed above in compact form)
+        # print(json.dumps(res_dense, indent=2, default=_json_default))
+        return
 
     # If a reference for fixed baseline is provided, run fixed-only path and exit.
     if args.fixed_baseline_reference:
@@ -315,7 +366,7 @@ def main():
         print_compact_summary(res_fixed)
         return
 
-    # --- default flow (policy, optional dense) ---
+    # --- default flow (policy, optional fixed-from-policy, optional dense baseline) ---
     model = PolicyHarnessLM(
         ckpt_dir=args.ckpt_dir,
         mode=args.mode,
