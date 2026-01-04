@@ -56,7 +56,7 @@ from utils.actions import build_action_spec
 import torch.backends.cuda as sdp
 sdp.enable_flash_sdp(False)
 sdp.enable_math_sdp(False)
-sdp.enable_mem_efficient_sdp(True)  # SDPA only
+sdp.enable_mem_efficient_sdp(True)
 from transformers.cache_utils import DynamicCache
 
 
@@ -64,7 +64,7 @@ def ensure_dynamic_cache(past_kv):
     """Convert legacy tuple cache -> DynamicCache if needed."""
     if isinstance(past_kv, tuple):
         return DynamicCache.from_legacy_cache(past_kv)
-    return past_kv  # already a Cache
+    return past_kv
 
 def repeat_legacy_cache_k(past_kv_tuple, K: int):
     """Repeat a tuple-of-(k,v) cache Kx along batch dim, return DynamicCache."""
@@ -129,14 +129,11 @@ def train_one_epoch_grpo(tok,
     policy_ref = (global_step_state or {}).get("_policy_ref", None)
 
 
-    # === Multi-budget targets (token keep, prune keep, quant bits) ===
-    # These are *default* targets; per‑rollout targets are sampled around them below.
     C_tok_default   = float(getattr(cfg, "C_target", getattr(cfg, "C_target_token", getattr(cfg, "keep_target", 1.0))))
     C_pru_default   = float(getattr(cfg, "C_target_prune", 0.70))
     C_qbits_default = float(getattr(cfg, "C_target_quant_bits", 8.0))
     C_q_default     = C_qbits_default / 16.0
 
-    # Fixed trade‑off weights between accuracy (delta CE) and compute costs.
     alpha_tok   = float(getattr(cfg, "alpha_tok", getattr(cfg, "cost_tradeoff_alpha", 1.0)))
     alpha_pru   = float(getattr(cfg, "alpha_prune", alpha_tok))
     alpha_quant = float(getattr(cfg, "alpha_quant", alpha_pru))
@@ -158,7 +155,6 @@ def train_one_epoch_grpo(tok,
     has_prune_dof = len(set(action_spec.prune_keep)) > 1
     has_quant_dof = len(set(action_spec.q_bits)) > 1
 
-    # If a dimension has no DOF, its cost weight is effectively zero.
     if not has_keep_dof:
         alpha_tok = 0.0
     if not has_prune_dof:
@@ -213,7 +209,6 @@ def train_one_epoch_grpo(tok,
         B, total_len = batch.shape
         assert total_len == cfg.context_len + cfg.rollout_len + 1
 
-        # --- Sample per‑sequence target budgets for this batch (normalized to [0,1]) ---
         def _sample_budget_1d(name: str, default: float) -> torch.Tensor:
             """
             Sample a target budget for each sequence i in the batch.
@@ -233,11 +228,8 @@ def train_one_epoch_grpo(tok,
                 return torch.empty(B, device=device).uniform_(float(lo), float(hi))
             return torch.full((B,), float(default), device=device)
 
-        # Token‑level keep target is already in [0,1].
         C_tok_target_B = _sample_budget_1d("budget_tok", C_tok_default)          # [B]
-        # Prune budget is expressed in normalized prune_keep ρ in [0,1].
         C_pru_target_B = _sample_budget_1d("budget_prune", C_pru_default)        # [B]
-        # Quantization budget uses qratio = bits/16 in [0,1].
         C_qratio_target_B = _sample_budget_1d("budget_q_ratio", C_q_default)     # [B]
 
         if global_step_state.get("save_stride") in (None, 0):
@@ -315,12 +307,10 @@ def train_one_epoch_grpo(tok,
         kv_len_pol = kv_len_pol.repeat_interleave(K, dim=0)      # [B*K]
         state_pol = state_pol.repeat_interleave(K, dim=0)        # [B*K]
         Bk = B * K
-        # Expand per‑sequence targets across K rollouts per input.
         C_tok_target_BK    = C_tok_target_B.repeat_interleave(K, dim=0)      # [BK]
         C_pru_target_BK    = C_pru_target_B.repeat_interleave(K, dim=0)      # [BK]
         C_qratio_target_BK = C_qratio_target_B.repeat_interleave(K, dim=0)   # [BK]
 
-        # Buffers (time-major)
         h_seq_buf, e_seq_buf, scalars_seq_buf = [], [], []
         prev_actions_seq_buf, actions_seq_buf = [], []
         logp_old_seq_buf = []
@@ -328,15 +318,12 @@ def train_one_epoch_grpo(tok,
         keep_buf, eff_mask_buf = [], []
         prune_keep_buf, qratio_buf = [], []
 
-        # Logging accumulators
         nll_sum = torch.tensor(0.0, device=device)
         tok_count = 0
         action_counts = torch.zeros(A, device=device)
         keep_chosen_sum = torch.tensor(0.0, device=device)
         cost_eff_sum = torch.tensor(0.0, device=device)
         eff_tok = torch.tensor(0.0, device=device)
-        # Recurrent policy state (BK) & per-episode budget trackers
-        # pi_state = policy.init_state(Bk, device=device)
         pi_state = policy_mod.init_state(Bk, device=device)
         prev_action_ids = pi_state.last_action.clone()
         cum_keep   = torch.zeros(Bk, device=device)  # sum_t eff_t * kappa_t
@@ -405,14 +392,6 @@ def train_one_epoch_grpo(tok,
                 dim=-1,
             )
             h_prev_for_policy = state_pol.to(torch.float32)
-            # logits, _value_unused, pi_state = policy.step(
-            #     # h_lm=state_pol.to(torch.float32),
-            #     h_lm=h_prev_for_policy,
-            #     e_tok=tok_embed.to(torch.float32),
-            #     scalars=scalars,
-            #     state=pi_state,
-            #     temperature=pi_temperature,
-            # )
 
             # Rollout collection does not need gradients through the policy
             with torch.no_grad():
@@ -483,7 +462,6 @@ def train_one_epoch_grpo(tok,
             eff = eff_mask.float()                                     # [BK]
             cost_t_eff   = eff * kappa_now                             # [BK]
 
-            # Episode-wise running sums (used for scalars on next step)
             cum_eff    = cum_eff    + eff
             cum_keep   = cum_keep   + cost_t_eff
             cum_prune  = cum_prune  + eff * (prune_now / P_MAX)
@@ -492,7 +470,6 @@ def train_one_epoch_grpo(tok,
             mean_keep_so_far = torch.where(
                 cum_eff > 0, cum_keep / cum_eff, torch.zeros_like(cum_eff)
             )
-            # LM state for policy is the *previous* LM state (before taking this action)
             h_seq_buf.append(h_prev_for_policy)
             e_seq_buf.append(tok_embed.to(torch.float32))
             scalars_seq_buf.append(scalars)
@@ -514,7 +491,6 @@ def train_one_epoch_grpo(tok,
             keep_chosen_sum += kappa_now[eff_mask].sum()
             cost_eff_sum += cost_t_eff.sum()
             eff_tok += eff.sum()
-            # Accumulate normalized prune ratio (0..1) for budget tracking
             agg_prune_sum  += float(((prune_now / P_MAX) * eff).sum().item())
             agg_qratio_sum += float((q_ratio   * eff).sum().item())
             agg_tok_steps  += float(eff.sum().item())
@@ -586,12 +562,10 @@ def train_one_epoch_grpo(tok,
         mean_prune_seq = (eff_all * prune_all_ratio).sum(dim=0) / sum_eff_seq   # [BK]
         mean_qratio_seq= (eff_all * qratio_all).sum(dim=0) / sum_eff_seq  # [BK]
 
-        # --- Multi‑budget compute costs (all roughly in [0,1]) ---
         keep_gap   = mean_keep_seq  - C_tok_target_BK           # [BK]
         prune_gap  = mean_prune_seq - C_pru_target_BK           # [BK]
         qratio_gap = mean_qratio_seq - C_qratio_target_BK       # [BK]
 
-        # For logging: batch-mean requested budgets and adherence
         mean_C_tok_target_batch    = float(C_tok_target_BK.mean().item())
         mean_C_pru_target_batch    = float(C_pru_target_BK.mean().item())
         mean_C_qratio_target_batch = float(C_qratio_target_BK.mean().item())
@@ -611,12 +585,9 @@ def train_one_epoch_grpo(tok,
         cost_pru_seq    = huber_sq(prune_gap,  tolerance)
         cost_qratio_seq = huber_sq(qratio_gap, tolerance)
 
-        # Broadcast per‑trajectory costs across rollout time to match x_for_adv shape.
         cost_tok = cost_tok_seq.view(1, -1).expand_as(x_for_adv)         # [T, BK]
         cost_pru = cost_pru_seq.view(1, -1).expand_as(x_for_adv)         # [T, BK]
         cost_q   = cost_qratio_seq.view(1, -1).expand_as(x_for_adv)      # [T, BK]
-
-        # Total reward for GRPO: accuracy (delta CE / KL‑mix) minus compute costs.
         computational_component = (
             alpha_tok   * cost_tok
             + alpha_pru * cost_pru
@@ -624,7 +595,6 @@ def train_one_epoch_grpo(tok,
         )
         r_total = x_for_adv - computational_component
 
-        # Compute advantage of the combined objective and (optionally) whiten it.
         adv = _grpo_adv(r_total, level=grpo_level)
         if adv_whiten_global:
             adv = (adv - adv.mean()) / adv.std(unbiased=False).clamp_min(1e-6)
@@ -640,10 +610,8 @@ def train_one_epoch_grpo(tok,
         agg_cost_eff_sum += float(cost_eff_sum.item())
         agg_eff_tok  += float(eff_tok.item())
         if agg_count >= target_N:
-            # if (run is not None) and (val_dl is not None) and (global_step_state["update"] % eval_every == 0):
             if (eval_every is not None) and (eval_every > 0) and (run is not None) and (val_dl is not None) and (global_step_state["update"] % eval_every == 0):
                 try:
-                    # Allow eval_* to be missing or None; fall back to the training defaults.
                     _eval_C_tok   = getattr(cfg, "eval_C_tok", None)
                     _eval_C_pru   = getattr(cfg, "eval_C_pru", None)
                     _eval_C_qbits = getattr(cfg, "eval_C_qbits", None)
@@ -663,9 +631,6 @@ def train_one_epoch_grpo(tok,
                     avg_prune_keep  = float(sparse_stats.get("avg_prune_keep", 0.0))
                     avg_quant_ratio = float(sparse_stats.get("avg_quant_ratio", 0.0))
 
-                    # If there are no structural/pruning/quant DOFs, treat this as the
-                    # single-budget regime and compare to a fixed matched baseline
-                    # evaluated at the *actual* policy budgets.
                     if (not has_prune_dof) and (not has_quant_dof):
                         policy_keep_eff_actual   = float(sparse_stats["avg_keep_effective"])
                         policy_prune_keep_actual = avg_prune_keep
@@ -764,14 +729,6 @@ def train_one_epoch_grpo(tok,
                     tbptt_k=tbptt_k,
                     temperature=pi_temperature,
                 )  # [T,Bmb,A], [T,Bmb]
-                # logits_seq, _values_unused = policy.forward_sequence(
-                #     h_seq=h_total[:, mb_idx, :],
-                #     e_seq=e_total[:, mb_idx, :],
-                #     scalars_seq=scalars_total[:, mb_idx, :],
-                #     prev_actions_seq=prev_actions_total[:, mb_idx],
-                #     tbptt_k=tbptt_k,
-                #     temperature=pi_temperature,
-                # )  # [T,Bmb,A], [T,Bmb]
                 dist_new = torch.distributions.Categorical(
                     logits=logits_seq.reshape(T*mb_idx.numel(), -1)
                 )
@@ -788,10 +745,7 @@ def train_one_epoch_grpo(tok,
                 entropy = dist_new.entropy().mean()
 
                 loss = policy_loss - entropy_coef * entropy
-                # Ensure critic params are "used" so grads are tensors (not None).
-                # 0.0 => no training signal, but avoids DDP+wandb grad=None issues.
                 loss = loss + 0.0 * values_seq.mean()
-                # loss = policy_loss - entropy_coef * entropy
                 ent_ratio = (entropy_coef * entropy).abs() / policy_loss.abs().clamp_min(1e-8)
                 if kl_pi_ref_coef > 0.0 and policy_ref is not None:
                     with torch.no_grad():
@@ -909,14 +863,11 @@ def train_one_epoch_grpo(tok,
                 "train/penalty_over_task_abs": ratio_abs,
                 "train/avg_keep_effective": keep_mean,
                 "train/mean_cost_eff": log_cost_eff,
-                # In the multi‑budget regime, "budget_gap_token" is keep_mean − E[C_tok_target].
                 "train/budget_gap_token": budget_gap_token,
                 "train/ppl_approx": ppl_approx,
-                # Budget sampling (what we asked for, on average this batch)
                 "budgets/target_tok_mean":    mean_C_tok_target_batch,
                 "budgets/target_prune_mean":  mean_C_pru_target_batch,
                 "budgets/target_qratio_mean": mean_C_qratio_target_batch,
-                # Budget adherence (how far we are from what we asked for)
                 "budgets/abs_keep_gap_mean":   avg_abs_keep_gap,
                 "budgets/abs_prune_gap_mean":  avg_abs_prune_gap,
                 "budgets/abs_qratio_gap_mean": avg_abs_qratio_gap,
@@ -982,354 +933,6 @@ def train_one_epoch_grpo(tok,
                     },
                     os.path.join(ckpt_dir, "policy_latest.pt"),
                 )
-    return logs
-
-def train_one_epoch_sft(
-    tok,
-    model,
-    policy,
-    cfg,
-    dl,
-    epoch: int = 0,
-    run=None,
-    val_dl=None,
-    eval_every: int = 100,
-    global_step_state: Optional[dict] = None,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    ckpt_dir: Optional[str] = None,
-    best_state: Optional[dict] = None,
-    meta: Optional[dict] = None,
-):
-    """
-    Supervised-Finetuning of the policy against the matched-keep teacher.
-
-    Key difference vs the old version:
-      * All teacher logic lives in `evaluate_sft_teacher_matched_keep`.
-      * For each batch, we call the teacher once (on that batch) with
-        `collect_policy_tensors=True`, then do a single CE step on the policy.
-
-    The LM stays frozen/inference-mode the whole time.
-    """
-
-    device = next(policy.parameters()).device
-    is_dist = dist.is_available() and dist.is_initialized()
-    is_main = (not is_dist) or dist.get_rank() == 0
-    grad_accum = int(getattr(cfg, "grad_accum_steps", 1))
-
-    unwrap_policy = unwrap(policy) if "unwrap" in globals() else policy
-    if optimizer is None:
-        optimizer = torch.optim.AdamW(unwrap_policy.parameters(), lr=getattr(cfg, "lr", 2e-4), fused=True)
-
-    if global_step_state is None:
-        global_step_state = {"micro": 0, "update": 0}
-    if "last_eval_update" not in global_step_state:
-        global_step_state["last_eval_update"] = -1
-
-    total_updates = int(getattr(cfg, "_sft_total_updates", 0))
-    if total_updates <= 0:
-        total_updates = max(1, math.ceil((len(dl) if hasattr(dl, "__len__") else 1) / max(1, int(getattr(cfg, "grad_accum_steps", 1)))))
-    warmup_updates = max(1, int(0.05 * total_updates))
-    peak_lr = float(getattr(cfg, "lr", 2e-4))
-    min_lr  = float(getattr(cfg, "sft_min_lr", 5e-5))
-    for g in optimizer.param_groups:
-        g["lr"] = peak_lr
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_updates,
-        num_training_steps=total_updates,
-        num_cycles=0.5,
-    )
-    if global_step_state.get("save_stride") in (None, 0):
-        global_step_state["save_stride"] = max(1, total_updates // 10)
-    C_target = float(getattr(cfg, "C_target", getattr(cfg, "keep_target", 1.0)))
-    pi_temperature = float(getattr(cfg, "pi_temperature", 0.7))
-    tbptt_k = int(getattr(cfg, "policy_tbptt_k", 0))
-    A = len(cfg.keep_fracs)
-
-    if global_step_state is None:
-        global_step_state = {"micro": 0, "update": 0}
-    if "lambda_keep" not in global_step_state:
-        global_step_state["lambda_keep"] = float(getattr(cfg, "lambda_init", 0.0))
-
-    try:
-        init_state_probe = policy.init_state(1, device=device)
-        initial_prev_action_idx = int(init_state_probe.last_action[0].item())
-    except Exception:
-        if 1.0 in cfg.keep_fracs:
-            initial_prev_action_idx = cfg.keep_fracs.index(1.0)
-        else:
-            initial_prev_action_idx = int(torch.tensor(cfg.keep_fracs).argmax().item())
-
-    model.eval()
-    policy.train()
-
-    logs = {
-        "avg_policy_ce": 0.0,
-        "avg_policy_kl": 0.0,
-        "avg_policy_acc": 0.0,
-        "avg_keep_chosen": 0.0, 
-        "avg_cost_eff": 0.0,
-        "avg_ppl_approx": 0.0,
-        "avg_abs_kl": 0.0,
-        "avg_penalty": 0.0,
-        "avg_abs_penalty": 0.0,
-        "avg_penalty_over_task_abs": 0.0,
-    }
-    steps_done = 0
-    action_hist_epoch = torch.zeros(A, device=device)
-
-    for batch in tqdm(dl, desc="Training (SFT, teacher-driven)...", disable=not is_main):
-        batch = batch.to(device)
-        B, total_len = batch.shape
-        assert total_len == cfg.context_len + cfg.rollout_len + 1, \
-            f"got {total_len}, expected {cfg.context_len + cfg.rollout_len + 1}"
-
-        teach = evaluate_sft_teacher_matched_keep(
-            cfg=cfg,
-            model=model,
-            dl=[batch],
-            Ts=cfg.Ts,
-            Tw=cfg.Tw,
-            keep_fracs=tuple(cfg.keep_fracs),
-            target_keep_effective=C_target,
-            context_len=cfg.context_len,
-            rollout_len=cfg.rollout_len,
-            device=cfg.device,
-            return_assignments=False,
-            collect_policy_tensors=True,
-            lambda_keep_value=float(global_step_state.get("lambda_keep", getattr(cfg, "lambda_init", 0.0))),
-            initial_prev_action=initial_prev_action_idx,
-        )
-        pb = teach["policy_batches"][0]
-        h_seq = pb["h_seq"]                 # [T, B, H],
-        e_seq = pb["e_seq"]                 # [T, B, E],
-        scalars_seq = pb["scalars_seq"]     # [T, B, 10],
-        prev_actions_seq = pb["prev_actions_seq"]         # [T, B]
-        teacher_actions_seq = pb["teacher_actions_seq"]   # [T, B]
-        same_prev = (prev_actions_seq[1:] == teacher_actions_seq[:-1]).float().mean()
-        logits_seq, _values_unused = policy.forward_sequence(
-            h_seq=h_seq,
-            e_seq=e_seq,
-            scalars_seq=scalars_seq,
-            prev_actions_seq=prev_actions_seq,
-            tbptt_k=tbptt_k,
-            temperature=1.0,
-        )  # [T, B, A]
-
-        T, Bmb, _ = logits_seq.shape
-        # eff_flag is scalar feature index 1: {0,1} for "controllable" steps
-        eff_mask = (scalars_seq[..., 1] > 0.5).float()    # [T,B]
-
-        ce = F.cross_entropy(
-            logits_seq.reshape(T * Bmb, A),
-            teacher_actions_seq.reshape(T * Bmb),
-            reduction="mean",
-        )
-        acc_exact = (logits_seq.argmax(-1) == teacher_actions_seq).float().mean()
-        p_true = F.softmax(logits_seq, -1).gather(-1, teacher_actions_seq.unsqueeze(-1)).mean()
-        ce_again = -p_true.log()
-        print(f"\nCE={ce.item():.4f}, acc={acc_exact.item():.4f}, CE(approx)={ce_again.item():.4f}\n")
-        loss = ce
-        with torch.no_grad():
-            acc = (logits_seq.argmax(dim=-1) == teacher_actions_seq).float().mean()
-        assert torch.all(prev_actions_seq[1:] == teacher_actions_seq[:-1])
-
-        did_step = False
-        if (global_step_state["micro"] % grad_accum) == 0:
-            optimizer.zero_grad(set_to_none=True)
-        (loss / grad_accum).backward()
-        if ((global_step_state["micro"] + 1) % grad_accum) == 0:
-            torch.nn.utils.clip_grad_norm_(unwrap_policy.parameters(), cfg.max_grad_norm)
-            optimizer.step()
-            scheduler.step()
-            for g in optimizer.param_groups:
-                if g["lr"] < min_lr:
-                    g["lr"] = min_lr
-            global_step_state["update"] += 1
-            did_step = True
-            stride = global_step_state.get("save_stride")
-            if is_main and ckpt_dir and stride:
-                upd = int(global_step_state["update"])
-                if upd % int(stride) == 0:
-                    path = os.path.join(ckpt_dir, f"policy_{upd}.pt")
-                    torch.save(
-                        {
-                            "epoch": epoch + 1,
-                            "update_step": upd,
-                            "policy_state_dict": unwrap(policy).state_dict(),
-                            "cfg": asdict(cfg),
-                            "meta": meta,
-                            "global_step_state": copy.deepcopy(global_step_state),
-                        },
-                        path,
-                    )
-                    torch.save(
-                        {
-                            "epoch": epoch + 1,
-                            "update_step": upd,
-                            "policy_state_dict": unwrap(policy).state_dict(),
-                            "cfg": asdict(cfg),
-                            "meta": meta,
-                            "global_step_state": copy.deepcopy(global_step_state),
-                        },
-                        os.path.join(ckpt_dir, "policy_latest.pt"),
-                    )
-
-        ppl_batch = float(teach["ppl"])
-        keep_eff_mean = float(teach["avg_keep_effective"])
-        action_counts = torch.tensor(teach["action_hist"], device=device, dtype=torch.float32)
-        if run is not None:
-            total_actions = action_counts.sum().clamp_min(1.0)
-            action_frac = {
-                f"action_fracs/action_frac/k={float(cfg.keep_fracs[i]):.2f}": float((action_counts[i] / total_actions).item())
-                for i in range(A)
-            }
-            metrics = {
-                "train/prev_equals_next": float(same_prev),
-                "train/policy_kl": float(loss.item()),
-                "train/policy_ce": float(loss.item()),
-                "train/policy_acc": float(acc.item()),
-                "train/avg_keep_effective": keep_eff_mean,
-                "train/mean_cost_eff": keep_eff_mean,
-                "train/ppl_approx": ppl_batch,
-                "train/lambda_keep": float(global_step_state.get("lambda_keep", 0.0)),
-                "train/avg_reward": 0.0,
-                "train/penalty_mean": 0.0,
-                "train/abs_kl_mean": 0.0,
-                "train/abs_penalty_mean": 0.0,
-                "train/penalty_over_task_abs": 0.0,
-                "update_step": global_step_state["update"],
-                "micro_step": global_step_state["micro"],
-            }
-            metrics.update(action_frac)
-            run.log(metrics)
-
-        logs["avg_policy_kl"] += float(loss.item())
-        logs["avg_policy_acc"] += float(acc.item())
-        logs["avg_keep_chosen"] += keep_eff_mean
-        logs["avg_cost_eff"] += keep_eff_mean
-        logs["avg_ppl_approx"] += ppl_batch
-        steps_done += 1
-        global_step_state["micro"] += 1
-        action_hist_epoch += action_counts
-
-        if did_step and (run is not None) and (val_dl is not None):
-            upd = int(global_step_state["update"])
-            if (upd > 0) and (upd % eval_every == 0) and (upd != global_step_state.get("last_eval_update", -1)):
-                try:
-                    # sparse_stats = evaluate_stateful_policy_rollout(
-                    #     cfg, model, policy, val_dl,
-
-                    sparse_stats = evaluate_stateful_policy_rollout(
-                        cfg, model, unwrap(policy), val_dl,
-                        Ts=cfg.Ts, Tw=cfg.Tw, keep_fracs=cfg.keep_fracs,
-                        context_len=cfg.context_len, rollout_len=cfg.rollout_len,
-                        device=cfg.device, greedy=True, temperature=1.0,
-                        lambda_keep=float(global_step_state.get("lambda_keep", 0.0)),
-                        lambda_prune=float(global_step_state.get("lambda_prune", 0.0)),
-                        lambda_quant=float(global_step_state.get("lambda_quant", 0.0)),
-                    )
-                    
-                    # Match a fixed baseline to the *actual* policy budgets.
-                    policy_keep_eff_actual = float(sparse_stats["avg_keep_effective"])
-                    policy_prune_keep_actual = float(sparse_stats.get("avg_prune_keep", 0.0))
-                    policy_quant_ratio_actual = float(sparse_stats.get("avg_quant_ratio", 0.0))
-
-                    fixed_matched = evaluate_fixed_matched_keep(
-                        cfg,
-                        model,
-                        val_dl,
-                        Ts=cfg.Ts,
-                        Tw=cfg.Tw,
-                        keep_fracs=tuple(cfg.keep_fracs),
-                        prune_choices=getattr(cfg, "struct_prune_choices", ("s100",)),
-                        quant_choices=getattr(cfg, "quant_choices", ("q16",)),
-                        target_keep_effective=policy_keep_eff_actual,
-                        target_prune_keep=policy_prune_keep_actual,
-                        target_quant_ratio=policy_quant_ratio_actual,
-                        context_len=cfg.context_len,
-                        rollout_len=cfg.rollout_len,
-                        device=cfg.device,
-                        struct_on_non_eff=False,
-                    )
-
-                    gap_nats = math.log(sparse_stats["ppl"]) - math.log(fixed_matched["ppl"])
-                    gap_ratio = sparse_stats["ppl"] / fixed_matched["ppl"]
-                    run.log({
-                        "special/gap_to_fixed_ln_ppl": float(gap_nats),
-                        "special/avg_keep_effective": float(sparse_stats["avg_keep_effective"]),
-                        "special/gap_ratio_to_fixed": float(gap_ratio),
-                        "special/fixed_ppl": float(fixed_matched["ppl"]),
-                        "special/sparse_ppl": float(sparse_stats["ppl"]),
-                        "update_step": upd,
-                    })
-                except Exception as _e:
-                    import pdb; pdb.set_trace()
-                    if is_main:
-                        print(f"[warn] eval (SFT) failed: {_e}")
-
-                if is_main and ckpt_dir is not None:
-                    print(f"Saving checkpoint to {ckpt_dir} ... at update {upd}")
-                    torch.save(
-                        {
-                            "epoch": epoch + 1,
-                            "update_step": upd,
-                            "policy_state_dict": unwrap_policy.state_dict(),
-                            "cfg": asdict(cfg),
-                            "meta": meta,
-                            "global_step_state": copy.deepcopy(global_step_state),
-                            "best_metric": best_state.get("best_metric", float("inf")) if best_state is not None else None,
-                        },
-                        os.path.join(ckpt_dir, "policy_latest.pt"),
-                    )
-                global_step_state["last_eval_update"] = upd
-
-    if (global_step_state["micro"] % grad_accum) != 0:
-        torch.nn.utils.clip_grad_norm_(unwrap_policy.parameters(), cfg.max_grad_norm)
-        optimizer.step()
-        scheduler.step()
-        for g in optimizer.param_groups:
-            if g["lr"] < min_lr:
-                g["lr"] = min_lr
-        global_step_state["update"] += 1
-        stride = global_step_state.get("save_stride")
-        if is_main and ckpt_dir and stride:
-            upd = int(global_step_state["update"])
-            if upd % int(stride) == 0:
-                path = os.path.join(ckpt_dir, f"policy_{upd}.pt")
-                torch.save(
-                    {
-                        "epoch": epoch + 1,
-                        "update_step": upd,
-                        "policy_state_dict": unwrap(policy).state_dict(),
-                        "cfg": asdict(cfg),
-                        "meta": meta,
-                        "global_step_state": copy.deepcopy(global_step_state),
-                    },
-                    path,
-                )
-                torch.save(
-                    {
-                        "epoch": epoch + 1,
-                        "update_step": upd,
-                        "policy_state_dict": unwrap(policy).state_dict(),
-                        "cfg": asdict(cfg),
-                        "meta": meta,
-                        "global_step_state": copy.deepcopy(global_step_state),
-                    },
-                    os.path.join(ckpt_dir, "policy_latest.pt"),
-                )
-
-    for k in logs:
-        logs[k] /= max(1, steps_done)
-
-    logs["action_hist_epoch"] = action_hist_epoch.tolist()
-    logs["avg_reward"] = 0.0
-    logs["avg_abs_kl"] = 0.0
-    logs["avg_penalty"] = 0.0
-    logs["avg_abs_penalty"] = 0.0
-    logs["avg_penalty_over_task_abs"] = 0.0
-
     return logs
 
 
@@ -1407,11 +1010,6 @@ def main():
     if is_main:
         ckpt_dir = os.path.join("checkpoints", (run.name if run is not None else f"RL4E-SFT-{timestamp}"))
         os.makedirs(ckpt_dir, exist_ok=True)
-        # snapshot_code(ckpt_dir, root_dir=os.getcwd(), skip_dirs = [
-        #         ".venv", ".git", "__pycache__", "wandb", "checkpoints", "block_cache",
-        #         "official_configs", "official_results", "newckpt", "old_ch", "sol",
-        #         "dec1_checkpoints", "dec6_checkpoints", "dec6_backup", "current_valid"
-        #     ])
         snapshot_code(
             ckpt_dir,
             root_dir=os.getcwd(),
@@ -1439,15 +1037,12 @@ def main():
     emb_layer = unwrap(model).get_input_embeddings()
     embed_dim = getattr(emb_layer, "embedding_dim", emb_layer.weight.shape[1])
 
-    # === Recurrent policy hyperparams (defaults; can be overridden in cfg) ===
     pol_d_model  = int(getattr(cfg, "policy_d_model", 768))
     pol_heads    = int(getattr(cfg, "policy_n_heads", 8))
     pol_layers   = int(getattr(cfg, "policy_n_layers", 2))
     pol_mlp_mult = float(getattr(cfg, "policy_mlp_ratio", 4.0))
     pol_act_dim  = int(getattr(cfg, "policy_action_dim", 32))
     pol_max_len  = int(getattr(cfg, "policy_max_len", max(1024, cfg.rollout_len + 8)))
-    # Number of scalar features provided to the policy per step.
-    # Must match the construction in train_one_epoch_grpo / teacher code.
     SCALAR_D = int(getattr(cfg, "policy_scalar_dim", 8))
     spec = build_action_spec(
         keep_fracs=cfg.keep_fracs,
@@ -1489,12 +1084,8 @@ def main():
             broadcast_buffers=False,
             find_unused_parameters=False,
         )
-    # if distributed:
-    #     policy = DDP(policy, device_ids=[local_rank] if torch.cuda.is_available() else None,
-    #                  output_device=local_rank if torch.cuda.is_available() else None)
     if is_main:
         _watch_target = unwrap(policy)
-        # wandb.watch(_watch_target, log="gradients", log_freq=500)
         wandb.config.update(
             {
                 "policy_num_params": sum(p.numel() for p in _watch_target.parameters()),
@@ -1540,13 +1131,7 @@ def main():
                 ckpt_dir=ckpt_dir, best_state=best_ckpt, meta=meta,
             )
         elif algo == "sft":
-            cfg._sft_total_updates = math.ceil(max_batches / max(1, int(getattr(cfg, "grad_accum_steps", 1))))
-            stats = train_one_epoch_sft(
-                tok, model, policy, cfg, dl_epoch, epoch=epoch,
-                run=run, val_dl=val_dl, eval_every=cfg.eval_every_updates,
-                global_step_state=global_step_state, optimizer=optimizer,
-                ckpt_dir=ckpt_dir, best_state=best_ckpt, meta=meta,
-            )
+            raise NotImplementedError(f"Unknown algo '{algo}'. Expected 'grpo'. SFT deprecated")
         else:
             raise NotImplementedError(f"Unknown algo '{algo}'. Expected 'grpo' or 'sft'.")
 

@@ -19,7 +19,7 @@ from utilities import find_latest_ckpt, load_cfg_from_checkpoint_or_yaml
 from predictor import RecurrentActorCriticPolicy
 from utils.actions import build_action_spec
 from tqdm import tqdm
-
+import math
 from lm_eval.api.model import LM
 from lm_eval import evaluator
 import os
@@ -47,6 +47,9 @@ class PolicyHarnessLM(LM):
         sparsity_bias: float = 0.0,
         prune_bias: float = 0.0,
         quant_bias: float = 0.0,
+        target_C_tok: Optional[float] = None,
+        target_C_pru: Optional[float] = None,
+        target_C_qbits: Optional[float] = None,
     ):
         super().__init__()
         self.ckpt_dir = ckpt_dir
@@ -95,9 +98,23 @@ class PolicyHarnessLM(LM):
         self.policy.load_state_dict(sd[state_key], strict=True)
         self.policy.eval()
         gs = sd.get("global_step_state", {}) or {}
-        lam_keep  = float(gs.get("lambda_keep",  0.0))
-        lam_prune = float(gs.get("lambda_prune", 0.0))
-        lam_quant = float(gs.get("lambda_quant", 0.0))
+
+        C_tok_default = float(
+            getattr(self.cfg, "C_target_token",
+                    getattr(self.cfg, "C_target",
+                            getattr(self.cfg, "keep_target", 1.0)))
+        )
+        C_pru_default = float(getattr(self.cfg, "C_target_prune", 0.70))
+        C_qbits_default = float(getattr(self.cfg, "C_target_quant_bits", 8.0))
+        eval_C_tok = getattr(self.cfg, "eval_C_tok", C_tok_default)
+        eval_C_pru = getattr(self.cfg, "eval_C_pru", C_pru_default)
+        eval_C_qbits = getattr(self.cfg, "eval_C_qbits", C_qbits_default)
+        if target_C_tok is not None:  eval_C_tok = float(target_C_tok)
+        if target_C_pru is not None:  eval_C_pru = float(target_C_pru)
+        if target_C_qbits is not None: eval_C_qbits = float(target_C_qbits)
+        # Default episode length for KV refresh = rollout_len (paper default T=16)
+        _ep_len = episode_len if episode_len is not None else int(getattr(self.cfg, "rollout_len", 16))
+
 
         # value = self.tripwire_mask_changes_logits(self.model, self.cfg)
         # print(f"Tripwire check: max logits change from mask hook = {value:.6f}. Success.")
@@ -109,12 +126,14 @@ class PolicyHarnessLM(LM):
             tokenizer=self.tok,
             greedy_policy=greedy_policy,
             policy_temperature=policy_temperature,
-            episode_len=episode_len if episode_len is not None else int(getattr(self.cfg, "rollout_len", 16)),
-            dense_refresh_tail=dense_refresh_tail if dense_refresh_tail is not None else int(getattr(self.cfg, "Ts",0) + getattr(self.cfg, "Tw",0) + 1),
+            episode_len=_ep_len,
+            dense_refresh_tail=dense_refresh_tail if dense_refresh_tail is not None else int(_ep_len),
+            # episode_len=episode_len if episode_len is not None else int(getattr(self.cfg, "rollout_len", 16)),
+            # dense_refresh_tail=dense_refresh_tail if dense_refresh_tail is not None else int(getattr(self.cfg, "Ts",0) + getattr(self.cfg, "Tw",0) + 1),
             dense_only=dense_only,
-            lambda_keep=lam_keep,
-            lambda_prune=lam_prune,
-            lambda_quant=lam_quant,
+            target_C_tok=eval_C_tok,
+            target_C_pru=eval_C_pru,
+            target_C_qbits=eval_C_qbits,
             sparsity_bias=sparsity_bias,
             prune_bias=prune_bias,
             quant_bias=quant_bias,
