@@ -284,8 +284,8 @@ def main():
         print_compact_summary(res_dense)
 
         if args.export_sparsity_json:
-            with open(args.export_sparsity_json, "w") as f:
-                json.dump(dense_stats, f, indent=2, default=_json_default)
+        #     with open(args.export_sparsity_json, "w") as f:
+        #         json.dump(dense_stats, f, indent=2, default=_json_default)
             print(f"[saved] per-request sparsity (dense-only) → {args.export_sparsity_json}")
 
             _write_key_metrics(
@@ -354,9 +354,9 @@ def main():
         print(json.dumps(fixed_stats["global"], indent=2, default=_json_default))
 
         if args.export_sparsity_json:
-            with open(args.export_sparsity_json, "w") as f:
-                json.dump(fixed_stats, f, indent=2, default=_json_default)
-            print(f"[saved] per-request sparsity (fixed) → {args.export_sparsity_json}")
+            # with open(args.export_sparsity_json, "w") as f:
+            #     json.dump(fixed_stats, f, indent=2, default=_json_default)
+            # print(f"[saved] per-request sparsity (fixed) → {args.export_sparsity_json}")
             _write_key_metrics(
                 sidecar_path=args.export_sparsity_json,
                 stats_fixed=fixed_stats, res_fixed=res_fixed,
@@ -396,12 +396,11 @@ def main():
     print("\n=== Observed sparsity (policy run) ===")
     print(json.dumps(stats_all["global"], indent=2))
 
-    if args.export_sparsity_json:
-        with open(args.export_sparsity_json, "w") as f:
-            json.dump(stats_all, f, indent=2, default=_json_default)
-        print(f"[saved] per-request sparsity → {args.export_sparsity_json}")
+    # if args.export_sparsity_json:
+    #     with open(args.export_sparsity_json, "w") as f:
+    #         json.dump(stats_all, f, indent=2, default=_json_default)
+    #     print(f"[saved] per-request sparsity → {args.export_sparsity_json}")
 
-    # --- NEW: optionally mirror policy budgets with FixedHarnessLM (no reference file) ---
     res_fixed = None
     fixed_stats = None
     if args.fixed_from_policy:
@@ -429,12 +428,12 @@ def main():
         print("\n=== Observed sparsity (fixed-from-policy) ===")
         print(json.dumps(fixed_stats["global"], indent=2, default=_json_default))
 
-        if args.export_sparsity_json:
-            root, ext = os.path.splitext(args.export_sparsity_json)
-            fixed_path = root + "_fixed" + ext
-            with open(fixed_path, "w") as f:
-                json.dump(fixed_stats, f, indent=2, default=_json_default)
-            print(f"[saved] per-request sparsity (fixed) → {fixed_path}")
+        # if args.export_sparsity_json:
+        #     root, ext = os.path.splitext(args.export_sparsity_json)
+        #     fixed_path = root + "_fixed" + ext
+        #     with open(fixed_path, "w") as f:
+        #         json.dump(fixed_stats, f, indent=2, default=_json_default)
+        #     print(f"[saved] per-request sparsity (fixed) → {fixed_path}")
 
     # If we saved JSON, (re)write compact key-metrics including fixed if present.
     if args.export_sparsity_json:
@@ -478,12 +477,12 @@ def main():
     dense_stats = dense_model.export_sparsity_stats()
     print("\n=== Observed sparsity (dense baseline) ===")
     print(json.dumps(dense_stats["global"], indent=2))
-    if args.export_sparsity_json:
-        root, ext = os.path.splitext(args.export_sparsity_json)
-        dense_path = root + "_dense" + ext
-        with open(dense_path, "w") as f:
-            json.dump(dense_stats, f, indent=2)
-        print(f"[saved] per-request sparsity (dense) → {dense_path}")
+    # if args.export_sparsity_json:
+        # root, ext = os.path.splitext(args.export_sparsity_json)
+        # dense_path = root + "_dense" + ext
+        # with open(dense_path, "w") as f:
+        #     json.dump(dense_stats, f, indent=2)
+        # print(f"[saved] per-request sparsity (dense) → {dense_path}")
 
     print("\n\n## Policy Result")
     print_compact_summary(res_policy)
