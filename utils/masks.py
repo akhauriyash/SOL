@@ -558,22 +558,6 @@ def _fake_quantize_bits(x: torch.Tensor, bits: int) -> torch.Tensor:
 
     return x_q.to(x.dtype)
 
-# # Removing this makes ppl go from 39.540 to 37.505 (replaced with fp32 calc)
-# def _fake_quantize_bits(x: torch.Tensor, bits: int) -> torch.Tensor:
-#     """Symmetric per-sample uniform fake quantization; bits >= 16 is identity."""
-#     if bits >= 16:
-#         return x
-#     qmax = (1 << (bits - 1)) - 1
-#     # Per-sample (batch, seq) scaling on the last dim
-#     # x: [B, T, D] or [B, D] -> normalize along D
-#     if x.dim() == 3:
-#         ax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
-#     else:
-#         ax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
-#     scale = ax / float(qmax)
-#     xq = torch.round(x / scale).clamp_(-qmax, qmax) * scale
-#     return xq
-
 
 def _fake_quantize_batched(x: torch.Tensor, bits_vec: torch.Tensor) -> torch.Tensor:
     """Apply _fake_quantize_bits per-example for possibly mixed bitwidths."""

@@ -31,7 +31,8 @@ from lm_eval import evaluator
 import os
 os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"
 import numpy as np
-
+from transformers.cache_utils import DynamicCache
+ 
 
 @dataclass
 class PolicyRuntimeState:
@@ -142,7 +143,7 @@ class FixedLMRunner:
         self._cum_qratio_sum = 0.0
 
         self.episode_len = int(episode_len) if episode_len is not None else int(getattr(cfg, "rollout_len", 16))
-        self.dense_refresh_tail = int(dense_refresh_tail) if dense_refresh_tail is not None else int(self.thr)
+        self.dense_refresh_tail = int(dense_refresh_tail) if dense_refresh_tail is not None else int(self.episode_len)
 
         self.emb_layer = unwrap(self.m).get_input_embeddings()
 
@@ -186,6 +187,72 @@ class FixedLMRunner:
         last_h  = out.hidden_states[-1][:, -1, :].detach()  # [1, H]
         last_logits = out.logits[:, -1, :]
         return past_kv, kv_len, last_h, last_logits
+
+    def _clone_past_kv(self, past_kv):
+        """
+        Deep-clone a HF KV cache so we can safely restore it later.
+        Works for:
+          - legacy tuple-of-layer-tuples (k,v)
+          - Cache objects with .to_legacy_cache()
+        Returns:
+          - DynamicCache if input is a Cache-like object
+          - legacy tuple otherwise
+        """
+        if past_kv is None:
+            return None
+        if hasattr(past_kv, "to_legacy_cache"):
+            legacy = past_kv.to_legacy_cache()
+            cloned_legacy = tuple(tuple(t.clone() for t in layer) for layer in legacy)
+            return DynamicCache.from_legacy_cache(cloned_legacy)
+        # Assume legacy tuple structure
+        return tuple(tuple(t.clone() for t in layer) for layer in past_kv)
+
+    @torch.inference_mode()
+    def _dense_replay_episode(
+        self,
+        past_kv_base,
+        kv_len_base: torch.Tensor,
+        episode_cur_tokens: List[int],
+    ):
+        """
+        Paper-style KV refresh:
+          - Restore the *dense* pre-episode cache (past_kv_base, kv_len_base)
+          - Replay the episode's processed "cur" tokens densely to rebuild their KV entries
+        Returns: (past_kv_new, kv_len_new, dense_state_lm_last)
+        """
+        # Ensure no sparsity/struct state bleeds into the dense replay.
+        clear_structured_action(self.m)
+        if self.criteria == "quest":
+            clear_quest_token_budgets(self.m)
+        elif self.criteria == "relevancy":
+            clear_relevancy_keep(self.m)
+
+        if len(episode_cur_tokens) == 0:
+            return past_kv_base, kv_len_base, None
+
+        input_ids = torch.tensor(
+            episode_cur_tokens, device=self.device, dtype=torch.long
+        ).view(1, -1)
+
+        past_len = int(kv_len_base.item()) - 1
+        pos_ids = torch.arange(
+            past_len, past_len + input_ids.size(1),
+            device=self.device, dtype=torch.long
+        ).view(1, -1)
+
+        out = self.m(
+            input_ids=input_ids,
+            use_cache=True,
+            past_key_values=past_kv_base,
+            position_ids=pos_ids,
+            attention_mask=None,  # dense replay
+            return_dict=True,
+            output_hidden_states=True,
+        )
+        past_kv_new = out.past_key_values
+        kv_len_new = kv_len_base + input_ids.size(1)
+        state_lm_dense = out.hidden_states[-1][:, -1, :].detach()
+        return past_kv_new, kv_len_new, state_lm_dense
 
     @torch.inference_mode()
     def score_continuation_fixed(self, ctx_ids: List[int], cont_ids: List[int]) -> Tuple[float, bool, dict]:
@@ -839,29 +906,17 @@ class PolicyLMRunner:
             hidden_size = int(getattr(unwrap(self.m).config, "hidden_size",
                                       getattr(unwrap(self.m).config, "n_embd", 0)))
             state_lm = torch.zeros(1, hidden_size, device=device, dtype=torch.float32)
+        # === Episode bookkeeping for periodic KV refresh ===
+        past_kv_base = self._clone_past_kv(past_kv)
+        kv_len_base = kv_len.clone()
+        episode_cur_tokens: List[int] = []
+
 
         for i, labels_next in enumerate(cont_ids):
-            if i > 0 and steps_in_episode == 0:
-                max_ctx = int(getattr(unwrap(self.m).config, "max_position_embeddings", 4096)) - 1
-                pref_window = min(self.dense_refresh_tail, max_ctx, len(running))
-                tail = running[-pref_window:] if pref_window > 0 else []
-                head = tail[:-1]
-                if len(head) > 0:
-                    past_kv, kv_len, state_lm, _ = self._dense_prefill(
-                        torch.tensor(head, device=device, dtype=torch.long)
-                    )
-                else:
-                    past_kv = None
-                    kv_len = torch.tensor([1], device=device, dtype=torch.long)
-                    hidden_size = int(getattr(unwrap(self.m).config, "hidden_size",
-                                              getattr(unwrap(self.m).config, "n_embd", 0)))
-                    state_lm = torch.zeros(1, hidden_size, device=device, dtype=torch.float32)
-                rt = self._new_episode_state(B=1)
-
             cur_tok = int(running[-1])
             cur = torch.tensor([cur_tok], device=device, dtype=torch.long)
             labels_next = int(labels_next)
-
+            episode_cur_tokens.append(cur_tok)
             eff_mask = (kv_len > self.thr)  # [1] bool
 
             if self.dense_only:
@@ -956,6 +1011,24 @@ class PolicyLMRunner:
             running.append(labels_next)
             steps_in_episode += 1
             if steps_in_episode >= self.episode_len:
+                steps_in_episode = 0
+            # Periodic KV refresh at episode boundary (paper behavior):
+            # restore dense base cache, replay episode cur tokens densely, reset policy state.
+            if steps_in_episode >= self.episode_len:
+                # Only refresh if we will continue scoring more tokens.
+                if i < (len(cont_ids) - 1):
+                    past_kv, kv_len, state_lm_dense = self._dense_replay_episode(
+                        past_kv_base=past_kv_base,
+                        kv_len_base=kv_len_base,
+                        episode_cur_tokens=episode_cur_tokens,
+                    )
+                    if state_lm_dense is not None:
+                        state_lm = state_lm_dense
+                    # Start next episode
+                    past_kv_base = self._clone_past_kv(past_kv)
+                    kv_len_base = kv_len.clone()
+                    episode_cur_tokens = []
+                    rt = self._new_episode_state(B=1)
                 steps_in_episode = 0
 
         # finalize
@@ -1055,27 +1128,17 @@ class PolicyLMRunner:
                                       getattr(unwrap(self.m).config, "n_embd", 0)))
             state_lm = torch.zeros(1, hidden_size, device=device, dtype=torch.float32)
 
+        # === Episode bookkeeping for periodic KV refresh ===
+        past_kv_base = self._clone_past_kv(past_kv)
+        kv_len_base = kv_len.clone()
+        episode_cur_tokens: List[int] = []
         for step in range(max_new_tokens):
-            if step > 0 and steps_in_episode == 0:
-                max_ctx = int(getattr(unwrap(self.m).config, "max_position_embeddings", 4096)) - 1
-                pref_window = min(self.dense_refresh_tail, max_ctx, len(running))
-                tail = running[-pref_window:] if pref_window > 0 else []
-                head = tail[:-1]
-                if len(head) > 0:
-                    past_kv, kv_len, state_lm, _ = self._dense_prefill(
-                        torch.tensor(head, device=device, dtype=torch.long)
-                    )
-                else:
-                    past_kv = None
-                    kv_len = torch.tensor([1], device=device, dtype=torch.long)
-                    hidden_size = int(getattr(unwrap(self.m).config, "hidden_size",
-                                              getattr(unwrap(self.m).config, "n_embd", 0)))
-                    state_lm = torch.zeros(1, hidden_size, device=device, dtype=torch.float32)
-                rt = self._new_episode_state(B=1)
-
             cur_tok = int(running[-1])
             cur = torch.tensor([cur_tok], device=device, dtype=torch.long)
             eff_mask = (kv_len > self.thr)
+            # Record the token processed this step for later dense replay refresh.
+            episode_cur_tokens.append(cur_tok)
+
 
             if self.dense_only:
                 a_eff = torch.tensor([self.dense_idx], device=device, dtype=torch.long)
@@ -1167,6 +1230,22 @@ class PolicyLMRunner:
 
             steps_in_episode += 1
             if steps_in_episode >= self.episode_len:
+                steps_in_episode = 0
+            if steps_in_episode >= self.episode_len:
+                # Only refresh if we will continue generating more tokens.
+                if step < (max_new_tokens - 1):
+                    past_kv, kv_len, state_lm_dense = self._dense_replay_episode(
+                        past_kv_base=past_kv_base,
+                        kv_len_base=kv_len_base,
+                        episode_cur_tokens=episode_cur_tokens,
+                    )
+                    if state_lm_dense is not None:
+                        state_lm = state_lm_dense
+                    # Start next episode
+                    past_kv_base = self._clone_past_kv(past_kv)
+                    kv_len_base = kv_len.clone()
+                    episode_cur_tokens = []
+                    rt = self._new_episode_state(B=1)
                 steps_in_episode = 0
 
         stats["keep_avg_all"] = (stats["keep_sum_all"] / max(1, stats["policy_steps"]))

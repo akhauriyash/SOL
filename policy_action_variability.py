@@ -16,6 +16,8 @@ from utils.eval import evaluate_stateful_policy_rollout
 from utils.eval_baselines import (
     evaluate_fixed_matched_keep,
     evaluate_randomized_matched_sparsity,
+    evaluate_emc_matched_structured,
+    evaluate_drift_aware_matched_structured,
 )
 from utils.config import Config
 from predictor import RecurrentActorCriticPolicy
@@ -200,6 +202,12 @@ def main():
         type=int,
         default=0,
         help="Number of random allocation trials to run as a baseline (0 = skip).",
+    )
+    parser.add_argument(
+        "--do_emc_and_driftaware",
+        action="store_true",
+        help="If set, also evaluate EMC and Drift-Aware (DAC) matched baselines at the achieved "
+             "policy budgets (keep/prune/quant) and write results to the CSV.",
     )
     args = parser.parse_args()
 
@@ -458,6 +466,77 @@ def main():
     )
     print(f"Fixed matched evaluation complete in {total_time:.2f} seconds.")
     print(f"Fixed Action Probs \t: {[f'{p:.3f}' for p in fixed_matched['action_probs']]}")
+    # -------------------- EMC + Drift-Aware baselines (optional) -------------------- #
+    emc_matched = None
+    dac_matched = None
+    if args.do_emc_and_driftaware:
+        # EMC
+        start_time = time.time()
+        emc_matched = evaluate_emc_matched_structured(
+            cfg,
+            model,
+            limited_dl(
+                make_dataloader(cfg, tok, split=E.split, shuffle=False, distributed=False),
+                E.eval_batches,
+            ),
+            Ts=cfg.Ts,
+            Tw=cfg.Tw,
+            keep_fracs=cfg.keep_fracs,
+            prune_choices=getattr(cfg, "struct_prune_choices", ("s100",)),
+            quant_choices=getattr(cfg, "quant_choices", ("q16",)),
+            target_keep_effective=target_keep_effective,
+            target_prune_keep=target_prune_keep,
+            target_quant_ratio=target_quant_ratio,
+            context_len=cfg.context_len,
+            rollout_len=cfg.rollout_len,
+            device=cfg.device,
+            struct_on_non_eff=False,
+        )
+        total_time = time.time() - start_time
+        print(
+            f"\nEMC (matched targets)\t\t: "
+            f"ppl={emc_matched['ppl']:.3f}  "
+            f"keep_all={emc_matched['avg_keep_all']:.3f}  "
+            f"keep_eff={emc_matched['avg_keep_effective']:.3f}  "
+            f"prune_keep={emc_matched['avg_prune_keep']:.3f}  "
+            f"quant_ratio={16*emc_matched['avg_quant_ratio']:.3f}\t"
+            f"tokens={emc_matched['tokens_effective']}/{emc_matched['tokens']}  "
+            f"(time={total_time:.2f}s)\n"
+        )
+
+        # Drift-Aware (DAC)
+        start_time = time.time()
+        dac_matched = evaluate_drift_aware_matched_structured(
+            cfg,
+            model,
+            limited_dl(
+                make_dataloader(cfg, tok, split=E.split, shuffle=False, distributed=False),
+                E.eval_batches,
+            ),
+            Ts=cfg.Ts,
+            Tw=cfg.Tw,
+            keep_fracs=cfg.keep_fracs,
+            prune_choices=getattr(cfg, "struct_prune_choices", ("s100",)),
+            quant_choices=getattr(cfg, "quant_choices", ("q16",)),
+            target_keep_effective=target_keep_effective,
+            target_prune_keep=target_prune_keep,
+            target_quant_ratio=target_quant_ratio,
+            context_len=cfg.context_len,
+            rollout_len=cfg.rollout_len,
+            device=cfg.device,
+            struct_on_non_eff=False,
+        )
+        total_time = time.time() - start_time
+        print(
+            f"\nDAC (matched targets)\t\t: "
+            f"ppl={dac_matched['ppl']:.3f}  "
+            f"keep_all={dac_matched['avg_keep_all']:.3f}  "
+            f"keep_eff={dac_matched['avg_keep_effective']:.3f}  "
+            f"prune_keep={dac_matched['avg_prune_keep']:.3f}  "
+            f"quant_ratio={16*dac_matched['avg_quant_ratio']:.3f}\t"
+            f"tokens={dac_matched['tokens_effective']}/{dac_matched['tokens']}  "
+            f"(time={total_time:.2f}s)\n"
+        )
     rand_ppl_trials = []
     rand_keep_all_trials = []
     rand_keep_eff_trials = []
@@ -548,6 +627,18 @@ def main():
         f"keep_eff_target={target_keep_effective:.3f}\t"
         f"tokens={fixed_matched['tokens_effective']}/{fixed_matched['tokens']}"
     )
+    if args.do_emc_and_driftaware and emc_matched is not None:
+        print(
+            f"EMC (matched targets)\t\t: "
+            f"ppl={emc_matched['ppl']:.3f}  keep_eff={emc_matched['avg_keep_effective']:.3f}  "
+            f"prune_keep={emc_matched['avg_prune_keep']:.3f}  quant_bits={16*emc_matched['avg_quant_ratio']:.3f}"
+        )
+    if args.do_emc_and_driftaware and dac_matched is not None:
+        print(
+            f"DAC (matched targets)\t\t: "
+            f"ppl={dac_matched['ppl']:.3f}  keep_eff={dac_matched['avg_keep_effective']:.3f}  "
+            f"prune_keep={dac_matched['avg_prune_keep']:.3f}  quant_bits={16*dac_matched['avg_quant_ratio']:.3f}"
+        )
 
     if "action_probs" in greedy:
         probs = ", ".join(f"{p:.2f}" for p in greedy["action_probs"])
@@ -566,7 +657,12 @@ def main():
     sparsity_levels = "|".join(f"{k:.6f}" for k in cfg.keep_fracs)
     policy_action_probs = "|".join(f"{p:.6f}" for p in greedy.get("action_probs", []))
     fixed_action_probs = "|".join(f"{p:.6f}" for p in fixed_matched.get("action_probs", []))
-
+    emc_action_probs = (
+        "|".join(f"{p:.6f}" for p in emc_matched.get("action_probs", [])) if emc_matched is not None else ""
+    )
+    dac_action_probs = (
+        "|".join(f"{p:.6f}" for p in dac_matched.get("action_probs", [])) if dac_matched is not None else ""
+    )
     row = {
         "ckpt_dir": ckpt_dir_last,
         "ckpt_path": ckpt_path,
@@ -597,6 +693,24 @@ def main():
         "sparsity_levels_kappa_order": sparsity_levels,
         "policy_action_probs_kappa_order": policy_action_probs,
         "fixed_action_probs_kappa_order": fixed_action_probs,
+
+        "do_emc_and_driftaware": bool(args.do_emc_and_driftaware),
+
+        # EMC baseline metrics (optional)
+        "emc_ppl": float(emc_matched["ppl"]) if emc_matched is not None else None,
+        "emc_keep_all": float(emc_matched["avg_keep_all"]) if emc_matched is not None else None,
+        "emc_keep_effective": float(emc_matched["avg_keep_effective"]) if emc_matched is not None else None,
+        "emc_prune_keep": float(emc_matched["avg_prune_keep"]) if emc_matched is not None else None,
+        "emc_quant_ratio": float(emc_matched["avg_quant_ratio"]) if emc_matched is not None else None,
+        "emc_action_probs": emc_action_probs,
+
+        # Drift-Aware (DAC) baseline metrics (optional)
+        "dac_ppl": float(dac_matched["ppl"]) if dac_matched is not None else None,
+        "dac_keep_all": float(dac_matched["avg_keep_all"]) if dac_matched is not None else None,
+        "dac_keep_effective": float(dac_matched["avg_keep_effective"]) if dac_matched is not None else None,
+        "dac_prune_keep": float(dac_matched["avg_prune_keep"]) if dac_matched is not None else None,
+        "dac_quant_ratio": float(dac_matched["avg_quant_ratio"]) if dac_matched is not None else None,
+        "dac_action_probs": dac_action_probs,
 
         "sparsity_criteria": getattr(cfg, "sparsity_criteria", None),
 

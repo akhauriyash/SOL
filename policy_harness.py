@@ -112,6 +112,9 @@ class PolicyHarnessLM(LM):
         if target_C_tok is not None:  eval_C_tok = float(target_C_tok)
         if target_C_pru is not None:  eval_C_pru = float(target_C_pru)
         if target_C_qbits is not None: eval_C_qbits = float(target_C_qbits)
+        # Default episode length for KV refresh = rollout_len (paper default T=16)
+        _ep_len = episode_len if episode_len is not None else int(getattr(self.cfg, "rollout_len", 16))
+
 
         # value = self.tripwire_mask_changes_logits(self.model, self.cfg)
         # print(f"Tripwire check: max logits change from mask hook = {value:.6f}. Success.")
@@ -123,8 +126,10 @@ class PolicyHarnessLM(LM):
             tokenizer=self.tok,
             greedy_policy=greedy_policy,
             policy_temperature=policy_temperature,
-            episode_len=episode_len if episode_len is not None else int(getattr(self.cfg, "rollout_len", 16)),
-            dense_refresh_tail=dense_refresh_tail if dense_refresh_tail is not None else int(getattr(self.cfg, "Ts",0) + getattr(self.cfg, "Tw",0) + 1),
+            episode_len=_ep_len,
+            dense_refresh_tail=dense_refresh_tail if dense_refresh_tail is not None else int(_ep_len),
+            # episode_len=episode_len if episode_len is not None else int(getattr(self.cfg, "rollout_len", 16)),
+            # dense_refresh_tail=dense_refresh_tail if dense_refresh_tail is not None else int(getattr(self.cfg, "Ts",0) + getattr(self.cfg, "Tw",0) + 1),
             dense_only=dense_only,
             target_C_tok=eval_C_tok,
             target_C_pru=eval_C_pru,
