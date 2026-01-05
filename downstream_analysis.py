@@ -46,6 +46,11 @@ for d in scan_dirs:
             if not isinstance(per_task, dict):
                 per_task = {}
 
+            # Also plot macro accuracy as an extra subplot by treating it like a task
+            macro = safe_get(v, ["accuracy", "macro"])
+            if macro is not None:
+                per_task = dict(per_task)  # don't mutate shared refs
+                per_task["macro"] = float(macro)
             rows.append(
                 {
                     "dir": d.name,

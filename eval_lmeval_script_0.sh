@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CKPT_DIR="/mnt/home/ya255/projects/SOL/checkpoints/Llama3B-20251231-163102"
+CKPT_DIR="/home/ya255/solp/SOL/official_results/checkpoints/Llama3B-20251231-163102"
 MODE="latest"
 TASKS="piqa,arc_easy,winogrande"
 BATCH_SIZE=16
@@ -10,7 +10,7 @@ POLICY_TEMPERATURE=0.6
 
 # Optional runtime knobs (leave empty to use cfg defaults inside harness)
 EPISODE_LEN=16            # e.g. 128
-DENSE_REFRESH_TAIL=""     # e.g. 129
+DENSE_REFRESH_TAIL=16     # e.g. 129
 
 # Biases
 SPARSITY_BIAS=0.0

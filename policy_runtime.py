@@ -764,6 +764,72 @@ class PolicyLMRunner:
         self.emb_layer = unwrap(self.m).get_input_embeddings()
         self._scalar_dim = int(getattr(self.pol, "scalar_dim", getattr(self.cfg, "policy_scalar_dim", 8)))
  
+    def _clone_past_kv(self, past_kv):
+        """
+        Deep-clone a HF KV cache so we can safely restore it later.
+        Works for:
+          - legacy tuple-of-layer-tuples (k,v)
+          - Cache objects with .to_legacy_cache()
+        Returns:
+          - DynamicCache if input is a Cache-like object
+          - legacy tuple otherwise
+        """
+        if past_kv is None:
+            return None
+        if hasattr(past_kv, "to_legacy_cache"):
+            legacy = past_kv.to_legacy_cache()
+            cloned_legacy = tuple(tuple(t.clone() for t in layer) for layer in legacy)
+            return DynamicCache.from_legacy_cache(cloned_legacy)
+        # Assume legacy tuple structure
+        return tuple(tuple(t.clone() for t in layer) for layer in past_kv)
+
+    @torch.inference_mode()
+    def _dense_replay_episode(
+        self,
+        past_kv_base,
+        kv_len_base: torch.Tensor,
+        episode_cur_tokens: List[int],
+    ):
+        """
+        Paper-style KV refresh:
+          - Restore the *dense* pre-episode cache (past_kv_base, kv_len_base)
+          - Replay the episode's processed "cur" tokens densely to rebuild their KV entries
+        Returns: (past_kv_new, kv_len_new, dense_state_lm_last)
+        """
+        # Ensure no sparsity/struct state bleeds into the dense replay.
+        clear_structured_action(self.m)
+        if self.criteria == "quest":
+            clear_quest_token_budgets(self.m)
+        elif self.criteria == "relevancy":
+            clear_relevancy_keep(self.m)
+
+        if len(episode_cur_tokens) == 0:
+            return past_kv_base, kv_len_base, None
+
+        input_ids = torch.tensor(
+            episode_cur_tokens, device=self.device, dtype=torch.long
+        ).view(1, -1)
+
+        past_len = int(kv_len_base.item()) - 1
+        pos_ids = torch.arange(
+            past_len, past_len + input_ids.size(1),
+            device=self.device, dtype=torch.long
+        ).view(1, -1)
+
+        out = self.m(
+            input_ids=input_ids,
+            use_cache=True,
+            past_key_values=past_kv_base,
+            position_ids=pos_ids,
+            attention_mask=None,  # dense replay
+            return_dict=True,
+            output_hidden_states=True,
+        )
+        past_kv_new = out.past_key_values
+        kv_len_new = kv_len_base + input_ids.size(1)
+        state_lm_dense = out.hidden_states[-1][:, -1, :].detach()
+        return past_kv_new, kv_len_new, state_lm_dense
+
 
     @torch.inference_mode()
     def _dense_prefill(self, ids: torch.LongTensor):
