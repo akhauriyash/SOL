@@ -14,23 +14,50 @@ from tqdm import tqdm
 from lm_eval.api.model import LM
 from lm_eval import evaluator
 import os
+os.environ["HF_ALLOW_CODE_EVAL"] = "1"
 import numpy as np
 import sys
+
+NFS = 0
 
 from policy_runtime import PolicyLMRunner
 from policy_harness import PolicyHarnessLM, FixedHarnessLM
 
+# def _eval_kwargs_for_tasks(tasks: list[str]) -> dict:
+#     # gsm8k_cot_llama (Meta/Llama-style) expects chat template + multiturn fewshot + 8-shot
+#     needs_llama_chat = ("gsm8k_cot_llama" in tasks)
+#     return dict(
+#         num_fewshot=(4 if needs_llama_chat else 0),
+#         apply_chat_template=needs_llama_chat,
+#         fewshot_as_multiturn=needs_llama_chat,
+#         confirm_run_unsafe_code=True,
+#     )
 def _select_accuracy_metric(metrics: dict) -> Optional[float]:
     """
     Pick a standard accuracy-like metric from an lm-eval results block.
-    Falls back to the first numeric entry if needed.
+    Falls back to any acc/exact_match-like key, then to the first numeric entry.
     """
-    for k in ("acc,none", "acc", "exact_match,none", "exact_match"):
+    preferred = (
+        "acc_norm,none", "acc_norm",
+        "acc,none", "acc",
+        "exact_match,none", "exact_match",
+        "exact_match,strict-match", "exact_match,strict_match",
+        "exact_match,strict", "exact_match_strict",
+    )
+    for k in preferred:
         if k in metrics and isinstance(metrics[k], (int, float)):
             return float(metrics[k])
+
+    # Any other acc/exact_match-ish numeric metric
+    for k, v in metrics.items():
+        if isinstance(v, (int, float)) and ("acc" in k or "exact_match" in k):
+            return float(v)
+
+    # Fallback: first numeric metric
     for _, v in metrics.items():
         if isinstance(v, (int, float)):
             return float(v)
+
     return None
 
 def _extract_accuracy(res: dict) -> dict:
@@ -127,6 +154,7 @@ def print_compact_summary(res):
             for k, v in metrics.items():
                 if isinstance(v, (int, float)):
                     print(f"{task} ({k}): {v:.4f}")
+                    accs.append(v)  # <-- add this
                     break
 
     agg = res.get("aggregated") or res.get("groups") or {}
@@ -275,11 +303,12 @@ def main():
             tasks=tasks,
             batch_size=args.batch_size,
             limit=args.limit,
-            num_fewshot=0,
+            num_fewshot=NFS,
+            confirm_run_unsafe_code=True,
         )
         dense_stats = dense_model.export_sparsity_stats()
         print("\n=== Observed sparsity (dense-only) ===")
-        print(json.dumps(dense_stats["global"], indent=2, default=_json_default))
+        # print(json.dumps(dense_stats["global"], indent=2, default=_json_default))
         print("\n\n## Dense-only result")
         print_compact_summary(res_dense)
 
@@ -347,7 +376,8 @@ def main():
 
         fixed_model = FixedHarnessLM(**fixed_kwargs_all)
         res_fixed = evaluator.simple_evaluate(
-            model=fixed_model, tasks=tasks, batch_size=args.batch_size, limit=args.limit, num_fewshot=0
+            model=fixed_model, tasks=tasks, batch_size=args.batch_size, limit=args.limit, num_fewshot=NFS,
+            confirm_run_unsafe_code=True,
         )
         fixed_stats = fixed_model.export_sparsity_stats()
         print("\n=== Observed sparsity (fixed from reference) ===")
@@ -390,9 +420,15 @@ def main():
         tasks=tasks,
         batch_size=args.batch_size,
         limit=args.limit,
-        num_fewshot=0,
+        num_fewshot=NFS,
+        confirm_run_unsafe_code=True,
     )
     stats_all = model.export_sparsity_stats()
+    if args.export_sparsity_json:
+        _write_key_metrics(
+            sidecar_path=args.export_sparsity_json,
+            stats_policy=stats_all, res_policy=res_policy,
+        )
     print("\n=== Observed sparsity (policy run) ===")
     print(json.dumps(stats_all["global"], indent=2))
 
@@ -422,7 +458,8 @@ def main():
 
         fixed_model = FixedHarnessLM(**fixed_kwargs_all)
         res_fixed = evaluator.simple_evaluate(
-            model=fixed_model, tasks=tasks, batch_size=args.batch_size, limit=args.limit, num_fewshot=0
+            model=fixed_model, tasks=tasks, batch_size=args.batch_size, limit=args.limit, num_fewshot=NFS,
+            confirm_run_unsafe_code=True,
         )
         fixed_stats = fixed_model.export_sparsity_stats()
         print("\n=== Observed sparsity (fixed-from-policy) ===")
@@ -469,7 +506,8 @@ def main():
         max_batch=args.batch_size,
     )
     res_dense = evaluator.simple_evaluate(
-        model=dense_model, tasks=tasks, batch_size=args.batch_size, limit=args.limit, num_fewshot=0
+        model=dense_model, tasks=tasks, batch_size=args.batch_size, limit=args.limit, num_fewshot=NFS,
+            confirm_run_unsafe_code=True,
     )
 
     print(json.dumps({"policy_sparse": res_policy, "dense_baseline": res_dense},

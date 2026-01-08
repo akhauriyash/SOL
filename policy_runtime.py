@@ -254,133 +254,6 @@ class FixedLMRunner:
         state_lm_dense = out.hidden_states[-1][:, -1, :].detach()
         return past_kv_new, kv_len_new, state_lm_dense
 
-    @torch.inference_mode()
-    def score_continuation_fixed(self, ctx_ids: List[int], cont_ids: List[int]) -> Tuple[float, bool, dict]:
-        device = self.device
-        running = ctx_ids[:]
-        total_lp = 0.0
-        is_greedy_all = True
-
-        self._cum_eff_steps = 0
-        self._cum_keep_sum = 0.0
-        self._cum_struct_steps = 0
-        self._cum_prune_sum = 0.0
-        self._cum_qratio_sum = 0.0
-
-        stats = {
-            "policy_steps": 0,
-            "effective_steps": 0,
-            "keep_sum_all": 0.0,
-            "keep_sum_eff": 0.0,
-            "prune_sum_all": 0.0,
-            "prune_sum_eff": 0.0,
-            "qratio_sum_all": 0.0,
-            "qratio_sum_eff": 0.0,
-            "action_hist": [0] * int(self.spec.n_actions),
-            "episode_len": self.episode_len,
-            "dense_refresh_tail": self.dense_refresh_tail,
-            "dense_first_token": (len(cont_ids) > 0),
-        }
-
-        steps_in_episode = 0
-        past_kv, kv_len, _state_lm = self._dense_prefill(torch.tensor(running, dtype=torch.long))
-
-        for i in range(0, len(cont_ids)):
-            if steps_in_episode == 0 and i > 0:
-                max_ctx = int(getattr(unwrap(self.m).config, "max_position_embeddings", 4096)) - 1
-                pref_window = min(self.dense_refresh_tail, max_ctx, len(running))
-                pref_ids = torch.tensor(running[-pref_window:], dtype=torch.long)
-                past_kv, kv_len, state_lm, last_logits = self._dense_prefill(pref_ids)
-            cur_tok = running[-1]
-            cur = torch.tensor([cur_tok], device=device, dtype=torch.long)
-            labels_next = cont_ids[i]
-
-            eff_mask = (kv_len > self.thr).item()
-
-            if eff_mask:
-                k_idx = self._choose_axis_idx(self.k_lo, self.k_hi, self.k_lo_v, self.k_hi_v,
-                                              self.t_keep, self._cum_keep_sum, self._cum_eff_steps)
-            else:
-                k_idx = self._dense_k
-
-            if self.struct_on_non_eff or eff_mask:
-                p_idx = self._choose_axis_idx(self.p_lo, self.p_hi, self.p_lo_v, self.p_hi_v,
-                                              self.t_prune, self._cum_prune_sum, self._cum_struct_steps)
-                q_idx = self._choose_axis_idx(self.q_lo, self.q_hi, self.q_lo_v, self.q_hi_v,
-                                              self.t_qratio, self._cum_qratio_sum, self._cum_struct_steps)
-            else:
-                p_idx, q_idx = self._dense_p, self._dense_q
-
-            kappa_now = torch.tensor([self._keep_axis[k_idx]], device=device, dtype=torch.float32)
-            prune_now = torch.tensor([self._prune_axis[p_idx]], device=device, dtype=torch.float32)
-            qbits_now = torch.tensor([self._qbits_axis[q_idx]], device=device, dtype=torch.int64)
-            qratio_now = qbits_now.to(torch.float32).clamp_(min=1.0) / 16.0
-
-            pos_ids = (kv_len - 1).clamp_min(0).unsqueeze(1)
-            bias = build_sparse_attention_bias(
-                model=self.m,
-                past_kv_lens=kv_len,
-                keep_fracs=kappa_now,
-                Ts=self.Ts, Tw=self.Tw,
-                device=device, dtype=self.dtype,
-                criteria=self.criteria, tier=self.tier,
-            )
-            set_structured_action(self.m, float(prune_now.item()), int(qbits_now.item()))
-            out_step = self.m(
-                input_ids=cur.view(1,1),
-                use_cache=True,
-                past_key_values=past_kv,
-                position_ids=pos_ids,
-                attention_mask=bias,
-                return_dict=True,
-            )
-            clear_structured_action(self.m)
-            logits_step = out_step.logits[:, -1, :]
-            past_kv = out_step.past_key_values
-            kv_len = kv_len + 1
-
-            # Stats
-            stats["policy_steps"] += 1
-            stats["keep_sum_all"] += float(kappa_now.item())
-            stats["prune_sum_all"] += float(prune_now.item())
-            stats["qratio_sum_all"] += float(qratio_now.item())
-            a_idx = self._kpq_to_action_idx(k_idx, p_idx, q_idx)
-            stats["action_hist"][a_idx] += 1
-            if eff_mask:
-                stats["effective_steps"] += 1
-                stats["keep_sum_eff"] += float(kappa_now.item())
-                stats["prune_sum_eff"] += float(prune_now.item())
-                stats["qratio_sum_eff"] += float(qratio_now.item())
-                # Advance residuals
-                self._cum_eff_steps += 1
-                self._cum_keep_sum += float(kappa_now.item())
-            if self.struct_on_non_eff or eff_mask:
-                self._cum_struct_steps += 1
-                self._cum_prune_sum += float(prune_now.item())
-                self._cum_qratio_sum += float(qratio_now.item())
-
-            # score and append the current continuation token
-            logp = F.log_softmax(logits_step, dim=-1)[0, labels_next]
-            total_lp += float(logp.item())
-            greedy_tok = int(torch.argmax(logits_step, dim=-1)[0].item())
-            if greedy_tok != labels_next:
-                is_greedy_all = False
-            running.append(labels_next)
-            steps_in_episode += 1
-            if steps_in_episode >= self.episode_len:
-                steps_in_episode = 0
-        print(f"Length: {len(cont_ids)}")
-        # Aggregate means (prefer effective)
-        stats["keep_avg_all"] = (stats["keep_sum_all"] / max(1, stats["policy_steps"]))
-        stats["keep_avg_eff"] = (stats["keep_sum_eff"] / max(1, stats["effective_steps"])) if stats["effective_steps"] > 0 else stats["keep_avg_all"]
-        total_actions = max(1, sum(stats["action_hist"]))
-        stats["action_probs"] = [c / total_actions for c in stats["action_hist"]]
-        stats["prune_avg_all"] = (stats["prune_sum_all"] / max(1, stats["policy_steps"]))
-        stats["prune_avg_eff"] = (stats["prune_sum_eff"] / max(1, stats["effective_steps"])) if stats["effective_steps"] > 0 else stats["prune_avg_all"]
-        stats["quant_ratio_avg_all"] = (stats["qratio_sum_all"] / max(1, stats["policy_steps"]))
-        stats["quant_ratio_avg_eff"] = (stats["qratio_sum_eff"] / max(1, stats["effective_steps"])) if stats["effective_steps"] > 0 else stats["quant_ratio_avg_all"]
-        stats["avg_prune_keep"] = stats["prune_avg_eff"]; stats["avg_quant_ratio"] = stats["quant_ratio_avg_eff"]
-        return total_lp, is_greedy_all, stats
 
     @torch.inference_mode()
     def score_continuation_fixed_batch(
@@ -434,7 +307,15 @@ class FixedLMRunner:
         cum_qratio_sum = 0.0
 
         # Initial dense prefill on context only; all continuation tokens will be controlled
+        bos = self.tok.bos_token_id
+        if bos is None:
+            bos = self.tok.eos_token_id
+        bos = int(bos) if bos is not None else 0
+
         for i in range(B):
+            # Ensure non-empty context (needed because we always read running[i][-1])
+            if len(running[i]) == 0:
+                running[i] = [bos]
             ctx = running[i]
             # PREFILL ALL BUT THE LAST CONTEXT TOKEN so the first scored token is produced under controls
             if len(ctx) > 0:
@@ -554,6 +435,11 @@ class FixedLMRunner:
                 kappa_now = torch.tensor([self._keep_axis[k_idx]], device=device, dtype=torch.float32)
                 prune_now = torch.tensor([self._prune_axis[p_idx]], device=device, dtype=torch.float32)
                 qbits_now = torch.tensor([self._qbits_axis[q_idx]], device=device, dtype=torch.int64)
+
+
+                # kappa_now = torch.tensor([1.0], device=device, dtype=torch.float32)
+                # prune_now = torch.tensor([1.0], device=device, dtype=torch.float32)
+                # qbits_now = torch.tensor([16], device=device, dtype=torch.int64)
                 qratio_now = qbits_now.to(torch.float32).clamp_(min=1.0) / 16.0
 
                 # pos_ids = kv_len[i].unsqueeze(1)
@@ -651,16 +537,193 @@ class FixedLMRunner:
         return_stats: bool = False,
     ):
         device = self.device
-        running = ctx_ids[:]
-        stats_dummy = {"policy_steps": 0, "effective_steps": 0, "keep_sum_all": 0.0, "keep_sum_eff": 0.0,
-                       "prune_sum_all": 0.0, "prune_sum_eff": 0.0, "qratio_sum_all": 0.0, "qratio_sum_eff": 0.0,
-                       "action_hist": [0] * int(self.spec.n_actions), "episode_len": self.episode_len,
-                       "dense_refresh_tail": self.dense_refresh_tail, "dense_first_token": False,
-                       "keep_avg_all": 1.0, "keep_avg_eff": 1.0, "prune_avg_all": 1.0, "prune_avg_eff": 1.0,
-                       "quant_ratio_avg_all": 1.0, "quant_ratio_avg_eff": 1.0, "avg_prune_keep": 1.0,
-                       "avg_quant_ratio": 1.0, "action_probs": [0.0] * int(self.spec.n_actions)}
-        raise NotImplementedError("generate_fixed is not implemented in FixedLMRunner")
-        # return (running[len(ctx_ids):], stats_dummy) if return_stats else running[len(ctx_ids):]
+        running = list(ctx_ids)
+        orig_ctx_len = len(running)
+
+        # Ensure non-empty context (so we can process "current token" each step).
+        if len(running) == 0:
+            bos = self.tok.bos_token_id
+            if bos is None:
+                bos = self.tok.eos_token_id
+            running = [int(bos) if bos is not None else 0]
+            orig_ctx_len = len(running)
+
+        stop_seqs = [self.tok.encode(s, add_special_tokens=False) for s in (until or [])]
+
+        # Clear any residual structured/sparsity state between requests
+        clear_structured_action(self.m)
+        if self.criteria == "quest":
+            clear_quest_token_budgets(self.m)
+        elif self.criteria == "relevancy":
+            clear_relevancy_keep(self.m)
+
+        # Fixed strategy for generation: choose the closest discrete action once and stick with it.
+        # (This avoids cross-request coupling that batched mixing would introduce for generation.)
+        def _nearest_idx(vals: List[float], target: float) -> int:
+            return int(min(range(len(vals)), key=lambda i: abs(float(vals[i]) - float(target))))
+
+        k_idx_const = _nearest_idx(self._keep_axis, self.t_keep)
+        p_idx_const = _nearest_idx(self._prune_axis, self.t_prune)
+        q_idx_const = _nearest_idx(self._qratio_axis, self.t_qratio)
+
+        stats = {
+            "policy_steps": 0,
+            "effective_steps": 0,          # token-sparsity effective steps
+            "keep_sum_all": 0.0,
+            "keep_sum_eff": 0.0,
+            "prune_sum_all": 0.0,
+            "prune_sum_eff": 0.0,          # structural effective steps (eff || struct_on_non_eff)
+            "qratio_sum_all": 0.0,
+            "qratio_sum_eff": 0.0,         # structural effective steps (eff || struct_on_non_eff)
+            "action_hist": [0] * int(self.spec.n_actions),
+            "episode_len": self.episode_len,
+            "dense_refresh_tail": self.dense_refresh_tail,
+            "dense_first_token": False,
+        }
+
+        def sample_from_logits(logits_1xV: torch.Tensor) -> int:
+            # logits_1xV: [1, V]
+            if temperature <= 0:
+                return int(torch.argmax(logits_1xV, dim=-1)[0].item())
+            probs = F.softmax(logits_1xV / float(temperature), dim=-1)
+            if top_k is not None and int(top_k) > 0:
+                k = min(int(top_k), probs.size(-1))
+                topk_vals, topk_idx = torch.topk(probs, k=k, dim=-1)
+                topk_probs = topk_vals / topk_vals.sum(dim=-1, keepdim=True)
+                idx = torch.multinomial(topk_probs, num_samples=1)
+                return int(topk_idx[0, idx[0]].item())
+            if top_p is not None and 0.0 < float(top_p) < 1.0:
+                sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
+                cumsum = torch.cumsum(sorted_probs, dim=-1)
+                mask = cumsum <= float(top_p)
+                mask[..., 0] = True
+                probs_f = (sorted_probs * mask).to(probs.dtype)
+                probs_f = probs_f / probs_f.sum(dim=-1, keepdim=True)
+                idx = torch.multinomial(probs_f, num_samples=1)
+                return int(sorted_idx[0, idx[0]].item())
+            return int(torch.multinomial(probs, num_samples=1)[0].item())
+
+        # Prefill all but the last context token so the first generated token is produced under controls.
+        head = running[:-1]
+        if len(head) > 0:
+            past_kv, kv_len, _last_h, _last_logits = self._dense_prefill(
+                torch.tensor(head, device=device, dtype=torch.long)
+            )
+        else:
+            past_kv = None
+            kv_len = torch.tensor([1], device=device, dtype=torch.long)
+
+        steps_in_episode = 0
+        for step in range(int(max_new_tokens)):
+            cur_tok = int(running[-1])
+            cur = torch.tensor([cur_tok], device=device, dtype=torch.long)
+
+            eff = bool((kv_len > self.thr).item())
+
+            # Token sparsity axis κ: only meaningful if effective
+            if eff:
+                k_idx = k_idx_const
+            else:
+                k_idx = self._dense_k
+
+            # Structured + quant axes: respect struct_on_non_eff
+            if self.struct_on_non_eff or eff:
+                p_idx = p_idx_const
+                q_idx = q_idx_const
+            else:
+                p_idx, q_idx = self._dense_p, self._dense_q
+
+            kappa_now = torch.tensor([self._keep_axis[k_idx]], device=device, dtype=torch.float32)
+            prune_now = torch.tensor([self._prune_axis[p_idx]], device=device, dtype=torch.float32)
+            qbits_now = torch.tensor([self._qbits_axis[q_idx]], device=device, dtype=torch.int64)
+            qratio_now = qbits_now.to(torch.float32).clamp_(min=1.0) / 16.0
+
+            pos_ids = (kv_len - 1).clamp_min(0).unsqueeze(1)
+            bias = build_sparse_attention_bias(
+                model=self.m,
+                past_kv_lens=kv_len,
+                keep_fracs=kappa_now,
+                Ts=self.Ts, Tw=self.Tw,
+                device=device, dtype=self.dtype,
+                criteria=self.criteria, tier=self.tier,
+            )
+            set_structured_action(self.m, float(prune_now.item()), int(qbits_now.item()))
+            out_step = self.m(
+                input_ids=cur.view(1, 1),
+                use_cache=True,
+                past_key_values=past_kv,
+                position_ids=pos_ids,
+                attention_mask=bias,
+                return_dict=True,
+            )
+            clear_structured_action(self.m)
+            if self.criteria == "quest":
+                clear_quest_token_budgets(self.m)
+            elif self.criteria == "relevancy":
+                clear_relevancy_keep(self.m)
+
+            logits_step = out_step.logits[:, -1, :]
+            past_kv = out_step.past_key_values
+            kv_len = kv_len + 1
+
+            # Stats
+            stats["policy_steps"] += 1
+            stats["keep_sum_all"] += float(kappa_now.item())
+            stats["prune_sum_all"] += float(prune_now.item())
+            stats["qratio_sum_all"] += float(qratio_now.item())
+            a_idx = self._kpq_to_action_idx(k_idx, p_idx, q_idx)
+            stats["action_hist"][a_idx] += 1
+            if eff:
+                stats["effective_steps"] += 1
+                stats["keep_sum_eff"] += float(kappa_now.item())
+            if eff or self.struct_on_non_eff:
+                stats["prune_sum_eff"] += float(prune_now.item())
+                stats["qratio_sum_eff"] += float(qratio_now.item())
+
+            nxt = sample_from_logits(logits_step)
+            running.append(int(nxt))
+
+            gen_ids = running[orig_ctx_len:]
+            trim = match_stop_suffix(gen_ids, stop_seqs)
+            if trim:
+                del running[-trim:]
+                break
+
+            steps_in_episode += 1
+            if steps_in_episode >= self.episode_len:
+                # Same refresh style you already use in the batch scorer:
+                # dense prefill over a tail window (truncates old context).
+                max_ctx = int(getattr(unwrap(self.m).config, "max_position_embeddings", 4096)) - 1
+                pref_window = min(int(self.dense_refresh_tail), max_ctx, len(running))
+                if pref_window > 1:
+                    tail_except_last = running[-pref_window:-1]
+                    if len(tail_except_last) > 0:
+                        pref_ids = torch.tensor(tail_except_last, device=device, dtype=torch.long)
+                        out = self._dense_prefill(pref_ids)
+                        past_kv, kv_len = out[0], out[1]
+                    else:
+                        past_kv, kv_len = None, torch.tensor([1], device=device, dtype=torch.long)
+                else:
+                    past_kv, kv_len = None, torch.tensor([1], device=device, dtype=torch.long)
+                steps_in_episode = 0
+
+        # Finalize stats
+        stats["keep_avg_all"] = stats["keep_sum_all"] / max(1, stats["policy_steps"])
+        stats["keep_avg_eff"] = (stats["keep_sum_eff"] / max(1, stats["effective_steps"])) if stats["effective_steps"] > 0 else stats["keep_avg_all"]
+        stats["prune_avg_all"] = stats["prune_sum_all"] / max(1, stats["policy_steps"])
+        stats["quant_ratio_avg_all"] = stats["qratio_sum_all"] / max(1, stats["policy_steps"])
+        denom_eff = stats["effective_steps"] if not self.struct_on_non_eff else stats["policy_steps"]
+        stats["prune_avg_eff"] = stats["prune_sum_eff"] / max(1, denom_eff)
+        stats["quant_ratio_avg_eff"] = stats["qratio_sum_eff"] / max(1, denom_eff)
+        stats["avg_prune_keep"] = stats["prune_avg_eff"]
+        stats["avg_quant_ratio"] = stats["quant_ratio_avg_eff"]
+        total_actions = max(1, sum(stats["action_hist"]))
+        stats["action_probs"] = [c / total_actions for c in stats["action_hist"]]
+
+        gen = running[orig_ctx_len:]
+        return (gen, stats) if return_stats else gen
+
+
 
 class PolicyLMRunner:
     def __init__(
@@ -745,7 +808,7 @@ class PolicyLMRunner:
         self.dense_only = bool(dense_only)
 
         self.episode_len = int(episode_len) if episode_len is not None else int(getattr(cfg, "rollout_len", 16))
-        self.dense_refresh_tail = int(dense_refresh_tail) if dense_refresh_tail is not None else int(self.thr)
+        self.dense_refresh_tail = int(dense_refresh_tail) if dense_refresh_tail is not None else int(self.episode_len)
 
         # === Target budgets (policy conditions on these) ===
         C_tok_default = float(getattr(cfg, "C_target_token", getattr(cfg, "C_target", getattr(cfg, "keep_target", 1.0))))
@@ -1042,6 +1105,10 @@ class PolicyLMRunner:
                 output_hidden_states=True,
             )
             clear_structured_action(self.m)
+            if self.criteria == "quest":
+                clear_quest_token_budgets(self.m)
+            elif self.criteria == "relevancy":
+                clear_relevancy_keep(self.m)
 
             logits_step = out_step.logits[:, -1, :]
             past_kv = out_step.past_key_values
@@ -1077,11 +1144,8 @@ class PolicyLMRunner:
             running.append(labels_next)
             steps_in_episode += 1
             if steps_in_episode >= self.episode_len:
-                steps_in_episode = 0
-            # Periodic KV refresh at episode boundary (paper behavior):
-            # restore dense base cache, replay episode cur tokens densely, reset policy state.
-            if steps_in_episode >= self.episode_len:
-                # Only refresh if we will continue scoring more tokens.
+                # Periodic KV refresh at episode boundary (paper behavior):
+                # restore dense base cache, replay episode cur tokens densely, reset policy state.
                 if i < (len(cont_ids) - 1):
                     past_kv, kv_len, state_lm_dense = self._dense_replay_episode(
                         past_kv_base=past_kv_base,
@@ -1090,7 +1154,6 @@ class PolicyLMRunner:
                     )
                     if state_lm_dense is not None:
                         state_lm = state_lm_dense
-                    # Start next episode
                     past_kv_base = self._clone_past_kv(past_kv)
                     kv_len_base = kv_len.clone()
                     episode_cur_tokens = []
@@ -1296,9 +1359,6 @@ class PolicyLMRunner:
 
             steps_in_episode += 1
             if steps_in_episode >= self.episode_len:
-                steps_in_episode = 0
-            if steps_in_episode >= self.episode_len:
-                # Only refresh if we will continue generating more tokens.
                 if step < (max_new_tokens - 1):
                     past_kv, kv_len, state_lm_dense = self._dense_replay_episode(
                         past_kv_base=past_kv_base,
@@ -1307,7 +1367,6 @@ class PolicyLMRunner:
                     )
                     if state_lm_dense is not None:
                         state_lm = state_lm_dense
-                    # Start next episode
                     past_kv_base = self._clone_past_kv(past_kv)
                     kv_len_base = kv_len.clone()
                     episode_cur_tokens = []
