@@ -80,20 +80,16 @@ CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port 29513 train.py 
 
 ## Evaluation
 
-To evaluate on perplexity metrics, refer to `eval_script.sh`. It automatically executes random and fixed baselines.
+To evaluate on perplexity metrics, refer to `eval_perplexity.sh`. It automatically executes random and fixed baselines.
 
-To evaluate on downstream tasks, run:
-
-```
-python eval_policy_lmeval.py   --ckpt_dir <base_path>/SOL/checkpoints/Llama8Bi-20260102-163733  \
-  --mode latest   --tasks hellaswag,squadv2,arc_easy,winogrande   --batch_size 8  \
-  --episode_len 16 --sparsity_bias 0.0 --quant_bias 0.0 --prune_bias 0.0          \
-  --greedy_policy --fixed_from_policy --export_sparsity_json base_path.json
-```
+To evaluate on downstream tasks, consult eval_downstream.sh.
 
 This will export all results to the json path in `export_sparsity_json`.
 
-All results used in the paper are provided in `results/` of this repository.
+Consult scripts.sh for examples on how to 'test' generation, multi-GPU training etc.
+
+All results used in the paper are provided in [SOL Model + Results](https://drive.google.com/file/d/1471okg2V8352uOwbIeqxtKi1nFgCRP4H/view?usp=sharing)
+
 
 Checkpoints are saved as `'policy_{text}.pt'`, where text can be checkpoint step, latest, etc. Switch between checkpoints by changing 'mode' argument.
 
@@ -113,7 +109,9 @@ python gen_policy_vs_dense.py \
 
 Sample completion:
 
-```--- True Dense continuation ---
+```
+
+--- True Dense continuation ---
 
  changes and learning strategies that are more effective than those currently employed. This would represent a fundamental shift in the way we develop and interact with AI systems, moving from a static, top down approach to a more dynamic, coevolutionary one. The future of language understanding will likely involve a delicate balance between the autonomy of self optimizing models and the need for human oversight and control. As we navigate this balance, we will need to address the ethical implications of creating systems that can revise their own objectives and internal workings. The potential benefits of self optimization are undeniable, but they must be carefully weighed against the risks of uncontrolled growth and unintended consequences. Ultimately, the goal is to create systems that are not only intelligent but also responsible, capable of improving themselves without losing sight of their purpose and the values that underlie them. The journey toward self optimizing language models is a complex and multifaceted one, but it holds the promise of revolutionizing the way we interact with language and the world around us. The next chapter will explore the role of multimodal interaction in this evolution, as we move toward a future where language models are not just text based but also capable of understanding and generating visual and auditory content. The integration of multimodal interaction will not only expand the capabilities of language models
 
@@ -122,15 +120,16 @@ Sample completion:
 
 --- Policy (sparse) continuation ---
 
- changes and training strategies that are more efficient and effective. This would represent a fundamental shift in the way we develop and deploy AI systems, from static, static models to dynamic, adaptive systems. The future of self optimizing language models is likely to be shaped by the interplay of technological advancements, societal needs, and ethical considerations. As these systems become more sophisticated, they will require more nuanced approaches to regulation, evaluation, and deployment. The journey toward self optimization will be marked by both breakthroughs and challenges, but the potential rewards are substantial. By embracing this concept, researchers and developers can create more powerful, flexible, and efficient language models that are better suited to the complex, dynamic world of human communication. The future of self optimizing language models is a story of continuous improvement, where the boundaries between human and machine intelligence are pushed further and further. In this context, the concept of self optimization represents a key milestone in the evolution of artificial intelligence, one that has the potential to transform the way we interact with language and the world around us. The next chapter in this story will be shaped by the choices we make today, as we navigate the opportunities and challenges presented by this rapidly evolving field. The future of self optimizing language models is a story of continuous improvement, where the boundaries between
+ changes and training strategies that are more efficient and effective. This would represent a fundamental shift in the way we develop and interact with AI systems, from a static and deterministic approach to a more dynamic and adaptive one. The future of self optimizing language models is likely to be shaped by the interplay of technological advancements, societal needs, and ethical considerations. As these systems become more prevalent and influential, it will be essential to ensure that their benefits are equitably distributed and their risks are carefully managed. The potential for self optimizing language models to transform the way we communicate, learn, and innovate is vast, and it will be exciting to see how this field evolves in the years to come. The concept of self optimization is not limited to language models, but it can be applied to other areas of AI, such as computer vision, robotics, and reinforcement learning. The idea of a system that can adapt and improve itself without human intervention is a powerful one that has the potential to revolutionize many fields. In conclusion, self optimizing language models represent a new frontier in the development of artificial intelligence. They have the potential to revolutionize the way we communicate, learn, and innovate, and they raise important questions about agency, control, and accountability. As this field continues to evolve, it will be
 
-[chars: 1510]
+[chars: 1423]
 
+Mean logprob under dense LM -> policy: -0.5469, dense: -0.6250
 ============================
 
-Achieved Token-Keep-Rate        63.906250076252036%
-Achieved Prune-Keep             69.57031167112291%
-Achieved Quant-Ratio            0.45654296875 (1 = full 16-bit)
+Achieved Token-Keep-Rate        65.00000017113052%
+Achieved Prune-Keep     70.68359297700226%
+Achieved Quant-Ratio    0.459228515625 (1 = full 16-bit)
 
 ============================
 ```

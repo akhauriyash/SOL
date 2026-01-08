@@ -25,7 +25,7 @@ from lm_eval import evaluator
 import os
 os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"
 import numpy as np
-
+import math
 
 class PolicyHarnessLM(LM):
     """
@@ -128,8 +128,6 @@ class PolicyHarnessLM(LM):
             policy_temperature=policy_temperature,
             episode_len=_ep_len,
             dense_refresh_tail=dense_refresh_tail if dense_refresh_tail is not None else int(_ep_len),
-            # episode_len=episode_len if episode_len is not None else int(getattr(self.cfg, "rollout_len", 16)),
-            # dense_refresh_tail=dense_refresh_tail if dense_refresh_tail is not None else int(getattr(self.cfg, "Ts",0) + getattr(self.cfg, "Tw",0) + 1),
             dense_only=dense_only,
             target_C_tok=eval_C_tok,
             target_C_pru=eval_C_pru,
@@ -538,20 +536,135 @@ class FixedHarnessLM(LM):
         return out
 
     def loglikelihood_rolling(self, requests):
-        out = []
-        for req in tqdm(requests, desc="loglikelihood_rolling", total=len(requests)):
-            (text,) = req.args if isinstance(req.args, (list, tuple)) else (req.args,)
+        """
+        Rolling loglikelihood for long texts.
+
+        We implement this by chunking the tokenized text into (ctx, cont) pairs
+        and scoring each chunk with the existing microbatch fixed scorer.
+
+        This preserves the "mix across a batch per step" behavior for fixed eval.
+        """
+        N = len(requests)
+        out = [0.0 for _ in range(N)]
+
+        # Per-request aggregated stats (sum raw counters across chunks, then finalize once).
+        def _blank_stats():
+            return {
+                "policy_steps": 0,
+                "effective_steps": 0,
+                "keep_sum_all": 0.0,
+                "keep_sum_eff": 0.0,
+                "prune_sum_all": 0.0,
+                "prune_sum_eff": 0.0,
+                "qratio_sum_all": 0.0,
+                "qratio_sum_eff": 0.0,
+                "action_hist": [0] * int(self.runner.spec.n_actions),
+                "episode_len": int(self.runner.episode_len),
+                "dense_refresh_tail": int(self.runner.dense_refresh_tail),
+                "dense_first_token": False,
+            }
+
+        agg = [None for _ in range(N)]
+
+        def _merge(dst, src):
+            dst["policy_steps"] += int(src.get("policy_steps", 0))
+            dst["effective_steps"] += int(src.get("effective_steps", 0))
+            dst["keep_sum_all"] += float(src.get("keep_sum_all", 0.0))
+            dst["keep_sum_eff"] += float(src.get("keep_sum_eff", 0.0))
+            dst["prune_sum_all"] += float(src.get("prune_sum_all", 0.0))
+            dst["prune_sum_eff"] += float(src.get("prune_sum_eff", 0.0))
+            dst["qratio_sum_all"] += float(src.get("qratio_sum_all", 0.0))
+            dst["qratio_sum_eff"] += float(src.get("qratio_sum_eff", 0.0))
+            ah = src.get("action_hist", None)
+            if ah is not None:
+                for i in range(min(len(dst["action_hist"]), len(ah))):
+                    dst["action_hist"][i] += int(ah[i])
+
+        # Build (request_idx, ctx_ids, cont_ids) chunks across all requests
+        chunks = []
+        bos = self.tok.bos_token_id
+        if bos is None:
+            bos = self.tok.eos_token_id
+        bos = int(bos) if bos is not None else 0
+
+        max_seq = int(self.max_length())
+        safety = 4
+
+        for ridx, req in enumerate(requests):
+            args = req.args if isinstance(req.args, (list, tuple)) else (req.args,)
+            (text,) = args
             ids = self.tok.encode(text, add_special_tokens=False)
-            if len(ids) <= 1:
-                out.append(0.0)
+            if len(ids) == 0:
+                out[ridx] = 0.0
+                agg[ridx] = _blank_stats()
                 continue
-            split = min(64, max(1, len(ids)//20))
-            ctx_ids, cont_ids = ids[:split], ids[split:]
-            max_ctx = self.max_length() - max(2, len(cont_ids)) - 4
-            if len(ctx_ids) > max_ctx:
-                ctx_ids = ctx_ids[-max_ctx:]
-            sum_lp, _ = self.runner.score_continuation_fixed(ctx_ids, cont_ids)
-            out.append(sum_lp)
+
+            # Prepend BOS so the first real token is scored (p(x0 | BOS)).
+            ids = [bos] + ids
+
+            # We will score tokens ids[1:] in chunks.
+            pos = 1
+            while pos < len(ids):
+                # Context is up to max_ctx tokens before pos (must be >= 1 token).
+                max_ctx = max(1, max_seq - safety - 1)
+                ctx_start = max(0, pos - max_ctx)
+                ctx_ids = ids[ctx_start:pos]
+                if len(ctx_ids) == 0:
+                    ctx_ids = [bos]
+
+                # Continuation chunk size so ctx + cont fits.
+                max_cont = max(1, (max_seq - safety) - len(ctx_ids))
+                cont_ids = ids[pos : min(len(ids), pos + max_cont)]
+                if len(cont_ids) == 0:
+                    break
+
+                chunks.append((ridx, ctx_ids, cont_ids))
+                pos += len(cont_ids)
+
+        # Score chunks in microbatches using the existing fixed batch scorer
+        i = 0
+        pbar = tqdm(total=len(chunks), desc="loglikelihood_rolling (fixed,microbatch)")
+        while i < len(chunks):
+            B = min(self._max_batch, len(chunks) - i)
+            chunk = chunks[i : i + B]
+
+            ctx_list = [c[1] for c in chunk]
+            cont_list = [c[2] for c in chunk]
+
+            lp_list, _greedy_list, stats_list = self.runner.score_continuation_fixed_batch(
+                ctx_list, cont_list
+            )
+
+            for j, (ridx, _ctx, _cont) in enumerate(chunk):
+                out[ridx] += float(lp_list[j])
+                if agg[ridx] is None:
+                    agg[ridx] = _blank_stats()
+                _merge(agg[ridx], stats_list[j])
+
+            i += B
+            pbar.update(B)
+        pbar.close()
+
+        # Finalize + record aggregated stats once per original request
+        for ridx, req in enumerate(requests):
+            s = agg[ridx]
+            if s is None:
+                s = _blank_stats()
+
+            s["keep_avg_all"] = s["keep_sum_all"] / max(1, s["policy_steps"])
+            s["keep_avg_eff"] = (s["keep_sum_eff"] / max(1, s["effective_steps"])) if s["effective_steps"] > 0 else s["keep_avg_all"]
+            s["prune_avg_all"] = s["prune_sum_all"] / max(1, s["policy_steps"])
+            s["quant_ratio_avg_all"] = s["qratio_sum_all"] / max(1, s["policy_steps"])
+            denom_eff = s["effective_steps"] if not self.runner.struct_on_non_eff else s["policy_steps"]
+            s["prune_avg_eff"] = s["prune_sum_eff"] / max(1, denom_eff)
+            s["quant_ratio_avg_eff"] = s["qratio_sum_eff"] / max(1, denom_eff)
+            s["avg_prune_keep"] = s["prune_avg_eff"]
+            s["avg_quant_ratio"] = s["quant_ratio_avg_eff"]
+            total_actions = max(1, sum(s["action_hist"]))
+            s["action_probs"] = [c / total_actions for c in s["action_hist"]]
+
+            self._record_request_stats(req, s)
+
         return out
 
     def generate_until(self, requests):

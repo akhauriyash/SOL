@@ -1,35 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CKPT_DIR="/mnt/home/ya255/projects/SOL/checkpoints/Llama3B-20251231-163102"
+CKPT_DIR="/mnt/home/ya255/projects/SOL/checkpoints/Llama8Bi-20260102-163733"
 MODE="latest"
-TASKS="piqa,arc_easy,winogrande"
-BATCH_SIZE=16
-LIMIT=200                 # empty = no limit, else e.g. 200
+TASKS="mmlu_conceptual_physics_continuation,mmlu_high_school_chemistry_continuation,mmlu_international_law_continuation"
+BATCH_SIZE=1             # pl keep batch size 1 for simplicity
+LIMIT=""                 # empty = no limit, else e.g. 200
 POLICY_TEMPERATURE=0.6
 
-# Optional runtime knobs (leave empty to use cfg defaults inside harness)
-EPISODE_LEN=16            # e.g. 128
-DENSE_REFRESH_TAIL=""     # e.g. 129
+# Optional runtime knobs 
+EPISODE_LEN=16           
+DENSE_REFRESH_TAIL=16    
 
 # Biases
 SPARSITY_BIAS=0.0
 PRUNE_BIAS=0.0
 QUANT_BIAS=0.0
 
-OUT_DIR="lmeval_scan_$(basename "$CKPT_DIR")_$(date +%Y%m%d-%H%M%S)"
+OUT_DIR="8b_lmeval_scan_$(basename "$CKPT_DIR")_$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT_DIR"
 
 # ---- random sampling controls ----
 SAMPLES=0              # 0 = run entire grid (in random order). else run this many unique random points
 SEED=12345             # reproducible shuffle seed
 # ----------------------------------
-PARETO_JSON="[[0.15, 0.4, 5.0], [0.15, 0.4, 6.0], [0.25, 0.4, 5.0], [0.25, 0.5, 5.0], [0.35, 0.4, 5.0], [0.35, 0.4, 6.0], [0.35, 0.5, 5.0], [0.35, 0.5, 6.0], [0.35, 0.6, 5.0], [0.35, 0.6, 6.0], [0.45, 0.5, 6.0], [0.45, 0.6, 5.0], [0.45, 0.6, 6.0], [0.45, 0.6, 7.0], [0.45, 0.7, 6.0], [0.55, 0.6, 5.0], [0.55, 0.6, 6.0], [0.55, 0.6, 7.0], [0.55, 0.6, 9.0], [0.55, 0.7, 7.0], [0.55, 0.8, 7.0], [0.65, 0.6, 6.0], [0.65, 0.6, 8.0], [0.65, 0.7, 6.0], [0.65, 0.7, 7.0], [0.65, 0.7, 8.0], [0.65, 0.7, 9.0], [0.65, 0.8, 6.0], [0.65, 0.8, 8.0], [0.65, 0.8, 9.0], [0.65, 0.9, 8.0], [0.95, 0.7, 7.0], [0.95, 0.7, 8.0], [0.95, 0.8, 7.0], [0.95, 0.8, 8.0], [0.95, 0.9, 9.0], [0.95, 0.9, 10.0], [0.95, 1.0, 11.0], [0.95, 1.0, 12.0]]"
+PARETO_JSON="[[0.15, 0.4, 5.0], [0.15, 0.4, 6.0], [0.15, 0.4, 7.0], [0.15, 0.4, 8.0], [0.15, 0.5, 5.0], [0.15, 0.5, 6.0], [0.15, 0.5, 7.0], [0.15, 0.5, 8.0], [0.15, 0.6, 5.0], [0.15, 0.6, 6.0], [0.15, 0.6, 7.0], [0.15, 0.7, 5.0], [0.15, 0.7, 6.0], [0.25, 0.4, 7.0], [0.25, 0.5, 6.0], [0.25, 0.6, 6.0], [0.25, 0.7, 5.0], [0.25, 0.7, 6.0], [0.25, 0.7, 7.0], [0.25, 0.7, 8.0], [0.35, 0.6, 6.0], [0.35, 0.6, 7.0], [0.35, 0.7, 5.0], [0.35, 0.7, 6.0], [0.35, 0.7, 7.0], [0.35, 0.7, 8.0], [0.35, 1.0, 8.0], [0.45, 0.6, 5.0], [0.45, 0.7, 6.0], [0.45, 0.7, 8.0], [0.45, 0.7, 9.0], [0.45, 0.8, 8.0], [0.55, 0.8, 8.0], [0.55, 0.8, 9.0], [0.55, 0.9, 8.0], [0.55, 0.9, 9.0], [0.55, 1.0, 8.0], [0.65, 0.8, 9.0], [0.65, 0.9, 9.0], [0.65, 0.9, 10.0], [0.65, 1.0, 8.0], [0.75, 0.8, 9.0], [0.75, 0.9, 8.0], [0.75, 0.9, 9.0], [0.75, 0.9, 10.0], [0.85, 0.9, 9.0], [0.85, 0.9, 11.0], [0.85, 1.0, 12.0], [0.95, 1.0, 13.0]]"
 # ---------------------------------------------------------------
 
 # ---- parallel partition controls ----
 WORKERS=4
-WORKER_ID=0
+WORKER_ID=2
 # -------------------------------------
 mapfile -t COMBOS < <(python - "$PARETO_JSON" <<'PY'
 import json, sys
@@ -145,7 +145,7 @@ for ((idx=0; idx<TOTAL; idx++)); do
 
   echo
   echo "[${ITER}/${TOTAL}] keep=$keep prune=$prune bits=$bits"
-  CUDA_VISIBLE_DEVICES=0 python eval_policy_lmeval.py \
+  CUDA_VISIBLE_DEVICES=3 python eval_policy_lmeval.py \
     --ckpt_dir "$CKPT_DIR" \
     --mode "$MODE" \
     --tasks "$TASKS" \
