@@ -2,10 +2,15 @@
 
 ![SOL Main Figure descriing how training and inference work.](SOLMainFig.png)
 
-Work on efficient Large Language Model (LLM) inference has emphasized how to make **every decoding step cheaper** (quantization, sparsity), but less so on **how much compute each token should receive**. This leaves deployments with a rigid, per-token budget that over-computes on easy tokens and under-computes on hard ones. We study \emph{dynamic budget allocation} for language models: learning how much compute to use for every generated token. Concretely, we train a small policy network ($0.5\%$ of the LLM size) that reads the LLM’s hidden state and selects a discrete action $\kappa \in \{\kappa_1,\dots,\kappa_A\}$ which controls the amount of compute allocated at every decode step. The base LLM weights are unchanged. This turns inference efficiency optimization into a sequential decision problem. We show that a learned policy can allocate dense context when it matters and sparse context when it does not. Further, our method can teach a policy to jointly optimize for quantization, sparsity and pruning. Self-Optimizing Language Models (SOL) consistently out-perform static budget-allocation strategies. SOL achieves a win-rate of 97.8\% over fixed-budget allocation, unlocking a complementary, underexplored dimension for efficiency optimization.
+Efficient LLM inference research has largely focused on reducing the cost of each decoding step (e.g., quantization, pruning, or sparse attention), typically applying a uniform budget to every generated token. In practice, token difficulty varies widely, so static compression can over-compute on easy steps and under-compute on hard ones. We study \emph{dynamic budget allocation} for autoregressive decoding: learning how much computation to spend \emph{per token} inside a single frozen model.
+
+Self-Optimizing Language Models (SOL) pair a frozen LLM with a lightweight autoregressive transformer policy network that reads the LLM hidden state and selects a discrete \emph{efficiency action} at each decode step. Actions can jointly control (i) token-level attention sparsity, (ii) structured activation pruning in the MLP, and (iii) activation quantization bit-width, while leaving the base model weights unchanged.
+
+We train the policy using group-relative policy optimization with teacher-forced episodes: the token sequence is fixed, while multiple counterfactual compute schedules are sampled and compared. The reward trades off language-model quality against soft penalties that encourage the episode-average budget usage to match a requested target (for one or multiple axes). Across model variants and compute regimes, SOL improves quality at matched budget relative to static allocation and strong random schedule search, providing a complementary axis for inference efficiency optimization.
+
 
 ## Policy Models
-All policy models tested in our paper as well as full csv of results + plotting code can be found on Google Drive as [SOL Model + Results](https://drive.google.com/file/d/1471okg2V8352uOwbIeqxtKi1nFgCRP4H/view?usp=sharing)
+All policy models tested in our paper as well as full csv of results + plotting code can be found on Google Drive as [SOL Model + Results](https://drive.google.com/file/d/1vTHHuQhLjaTGPWzSM_LvL1v_rKEWpTkF/view?usp=sharing)
 
 
 ## Configuration
@@ -71,7 +76,8 @@ pi_temperature: 1.3              # rollout sampling temperature
 
 ## Training
 
-Example scripts are provided in `scripts.sh`. Single training example
+Example scripts are provided in `scripts.sh`. Single-GPU training example
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port 29513 train.py   \
   --wandb_project SOL_RLS_MSC     --wandb_run_name Llama8Bi                       \
@@ -88,8 +94,7 @@ This will export all results to the json path in `export_sparsity_json`.
 
 Consult scripts.sh for examples on how to 'test' generation, multi-GPU training etc.
 
-All results used in the paper are provided in [SOL Model + Results](https://drive.google.com/file/d/1471okg2V8352uOwbIeqxtKi1nFgCRP4H/view?usp=sharing)
-
+All results used in the paper are provided in [SOL Model + Results](https://drive.google.com/file/d/1vTHHuQhLjaTGPWzSM_LvL1v_rKEWpTkF/view?usp=sharing)
 
 Checkpoints are saved as `'policy_{text}.pt'`, where text can be checkpoint step, latest, etc. Switch between checkpoints by changing 'mode' argument.
 
