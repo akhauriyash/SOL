@@ -268,7 +268,8 @@ class PolicyHarnessLM(LM):
         return int(getattr(unwrap(self.model).config, "max_position_embeddings", 4096))
 
     def max_gen_toks(self):
-        return 256
+        # return 4096
+        return 16
 
     def batch_size(self):
         return self._max_batch
@@ -339,7 +340,10 @@ class PolicyHarnessLM(LM):
                 gen_kwargs = {"until": until_list}
 
             until = gen_kwargs.get("until", None)
-            max_new = int(gen_kwargs.get("max_gen_toks", self.max_gen_toks()))
+            if self.max_gen_toks() is not None:
+                max_new = self.max_gen_toks()
+            else:
+                max_new = int(gen_kwargs.get("max_gen_toks"), 64)
             temperature = float(gen_kwargs.get("temperature", 0.0))
             top_p = gen_kwargs.get("top_p", None)
             top_k = gen_kwargs.get("top_k", None)
@@ -481,7 +485,8 @@ class FixedHarnessLM(LM):
         return int(getattr(unwrap(self.model).config, "max_position_embeddings", 4096))
 
     def max_gen_toks(self):
-        return 256
+        # return 4096
+        return 16
 
     def batch_size(self):
         return self._max_batch
@@ -677,7 +682,10 @@ class FixedHarnessLM(LM):
                 ctx, until_list = args
                 gen_kwargs = {"until": until_list}
             until = gen_kwargs.get("until", None)
-            max_new = int(gen_kwargs.get("max_gen_toks", self.max_gen_toks()))
+            if self.max_gen_toks() is not None:
+                max_new = self.max_gen_toks()
+            else:
+                max_new = int(gen_kwargs.get("max_gen_toks"), 64)
             temperature = float(gen_kwargs.get("temperature", 0.0))
             top_p = gen_kwargs.get("top_p", None)
             top_k = gen_kwargs.get("top_k", None)

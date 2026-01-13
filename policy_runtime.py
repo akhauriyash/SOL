@@ -32,7 +32,42 @@ import os
 os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"
 import numpy as np
 from transformers.cache_utils import DynamicCache
- 
+
+def _stream_decoded_token(tok, step_idx: int, gen_ids: list[int], new_token_id: int, prev_text: str = ""):
+    """
+    Prints (step_idx, token_text) and full decoded text so far.
+    Returns updated prev_text (so caller can diff cheaply/robustly).
+    """
+    # Full decoded text so far (generated portion only)
+    cur_text = tok.decode(
+        gen_ids,
+        skip_special_tokens=False,
+        clean_up_tokenization_spaces=False,
+    )
+
+    # "Detokenized text for *this* token": robustly take suffix difference.
+    if cur_text.startswith(prev_text):
+        delta = cur_text[len(prev_text):]
+    else:
+        # Fallback: decode single token (usually fine for LLaMA tokenizers)
+        delta = tok.decode(
+            [new_token_id],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+
+    # Token “piece” view can also be useful for debugging
+    try:
+        piece = tok.convert_ids_to_tokens([new_token_id])[0]
+    except Exception:
+        piece = "<unk>"
+    print(delta, end="", flush=True)
+    # print(f"{step_idx}\t{repr(delta)}\t(id={new_token_id}, piece={repr(piece)})")
+    # print(cur_text)
+    # print("-" * 80)
+
+    return cur_text
+
 
 @dataclass
 class PolicyRuntimeState:
@@ -613,6 +648,8 @@ class FixedLMRunner:
             past_kv = None
             kv_len = torch.tensor([1], device=device, dtype=torch.long)
 
+        decoded_prev = ""
+
         steps_in_episode = 0
         for step in range(int(max_new_tokens)):
             cur_tok = int(running[-1])
@@ -682,6 +719,16 @@ class FixedLMRunner:
 
             nxt = sample_from_logits(logits_step)
             running.append(int(nxt))
+
+            gen_ids_now = running[orig_ctx_len:]
+            # if os.environ.get("STREAM_DECODE", "0") == "1":
+            decoded_prev = _stream_decoded_token(
+                self.tok,
+                step_idx=step,
+                gen_ids=gen_ids_now,
+                new_token_id=int(nxt),
+                prev_text=decoded_prev,
+            )
 
             gen_ids = running[orig_ctx_len:]
             trim = match_stop_suffix(gen_ids, stop_seqs)
@@ -1256,6 +1303,15 @@ class PolicyLMRunner:
             hidden_size = int(getattr(unwrap(self.m).config, "hidden_size",
                                       getattr(unwrap(self.m).config, "n_embd", 0)))
             state_lm = torch.zeros(1, hidden_size, device=device, dtype=torch.float32)
+        
+        decoded_prev = ""
+        print("=== INPUT (ctx_ids decoded) ===", flush=True)
+        print(self.tok.decode(
+            running[:orig_ctx_len],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        ), flush=True)
+        print("===============================", flush=True)
 
         # === Episode bookkeeping for periodic KV refresh ===
         past_kv_base = self._clone_past_kv(past_kv)
@@ -1343,6 +1399,15 @@ class PolicyLMRunner:
 
             nxt = sample_from_logits(logits_step)
             running.append(int(nxt))
+            gen_ids_now = running[orig_ctx_len:]
+            # if os.environ.get("STREAM_DECODE", "0") == "1":
+            decoded_prev = _stream_decoded_token(
+                self.tok,
+                step_idx=step,
+                gen_ids=gen_ids_now,
+                new_token_id=int(nxt),
+                prev_text=decoded_prev,
+            )
 
             gen_ids = running[orig_ctx_len:]
             trim = match_stop_suffix(gen_ids, stop_seqs)
