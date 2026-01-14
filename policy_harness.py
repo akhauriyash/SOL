@@ -27,6 +27,8 @@ os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"
 import numpy as np
 import math
 
+KeyPrompt = "Please reason concisely, and put your final answer within \\boxed{}."
+
 class PolicyHarnessLM(LM):
     """
     LM-Eval-compatible wrapper that routes scoring & generation through the policy runner.
@@ -268,8 +270,8 @@ class PolicyHarnessLM(LM):
         return int(getattr(unwrap(self.model).config, "max_position_embeddings", 4096))
 
     def max_gen_toks(self):
-        # return 4096
-        return 16
+        # return 768
+        return 768
 
     def batch_size(self):
         return self._max_batch
@@ -347,6 +349,13 @@ class PolicyHarnessLM(LM):
             temperature = float(gen_kwargs.get("temperature", 0.0))
             top_p = gen_kwargs.get("top_p", None)
             top_k = gen_kwargs.get("top_k", None)
+
+            # ctx_ids = self.tok.encode(ctx, add_special_tokens=False)
+
+            # Replace trailing "Answer:" with the desired instruction (once).
+            s = ctx.rstrip()
+            if s.endswith("Answer:"):
+                ctx = s[:-len("Answer:")].rstrip() + f"\n{KeyPrompt}\n"
 
             ctx_ids = self.tok.encode(ctx, add_special_tokens=False)
             max_ctx = self.max_length() - 128
@@ -485,8 +494,8 @@ class FixedHarnessLM(LM):
         return int(getattr(unwrap(self.model).config, "max_position_embeddings", 4096))
 
     def max_gen_toks(self):
-        # return 4096
-        return 16
+        # return 768
+        return 768
 
     def batch_size(self):
         return self._max_batch
@@ -689,6 +698,12 @@ class FixedHarnessLM(LM):
             temperature = float(gen_kwargs.get("temperature", 0.0))
             top_p = gen_kwargs.get("top_p", None)
             top_k = gen_kwargs.get("top_k", None)
+
+            # ctx_ids = self.tok.encode(ctx, add_special_tokens=False)
+            # Replace trailing "Answer:" with the desired instruction (once).
+            s = ctx.rstrip()
+            if s.endswith("Answer:"):
+                ctx = s[:-len("Answer:")].rstrip() + f"\n{KeyPrompt}\n"
 
             ctx_ids = self.tok.encode(ctx, add_special_tokens=False)
             max_ctx = self.max_length() - 128
