@@ -18,7 +18,7 @@ os.environ["HF_ALLOW_CODE_EVAL"] = "1"
 import numpy as np
 import sys
 
-NFS = 0
+NFS = 8
 
 from policy_runtime import PolicyLMRunner
 from policy_harness import PolicyHarnessLM, FixedHarnessLM
