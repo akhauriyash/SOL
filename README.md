@@ -10,7 +10,7 @@ We train the policy using group-relative policy optimization with teacher-forced
 
 
 ## Policy Models
-All policy models tested in our paper as well as full csv of results + plotting code can be found on Google Drive as [SOL Model + Results](https://drive.google.com/file/d/1vTHHuQhLjaTGPWzSM_LvL1v_rKEWpTkF/view?usp=sharing)
+All policy models tested in our paper as well as full csv of results + plotting code can be found on Google Drive as [SOL Model + Results](https://drive.google.com/file/d/1E9_ztqnesJ-GLqZrMO4Rx-RGKSOLzdzY/view?usp=sharing)
 
 
 ## Configuration
